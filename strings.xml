@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">UpgradeHub</string>
+    <string name="recaptcha_site_key">6Lf_PLACEHOLDER_RECAPTCHA_ENTERPRISE_KEY_ANDROID</string>
+</resources>
