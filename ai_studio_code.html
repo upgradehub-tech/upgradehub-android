@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Dynamic Batch Planner</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 2rem; background: #f8fafc; color: #1e293b; }
+    .container { max-width: 1040px; margin: auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+    .form-group { margin-bottom: 1.25rem; }
+    label { font-weight: 600; display: block; margin-bottom: .4rem; }
+    input, select, button { padding: 0.6rem 0.8rem; font-size: 1rem; border: 1px solid #cbd5e1; border-radius: 4px; }
+    input[type="url"] { width: 70%; }
+    button { background: #2563eb; color: white; cursor: pointer; border: none; }
+    button:disabled { background: #94a3b8; }
+    .error-box { background: #fef2f2; border: 1px solid #ef4444; color: #991b1b; padding: 1rem; border-radius: 4px; margin-top: 1rem; }
+    .card { background: #f1f5f9; padding: 1rem; border-radius: 6px; margin-top: 1rem; }
+    .slot-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 8px; }
+    .slot-card { background: white; border: 1px solid #e2e8f0; padding: 10px; border-radius: 4px; font-size: 0.85rem; }
+    .slot-title { font-weight: 700; color: #0f172a; margin-bottom: 4px; }
+    .day-block { border: 1px solid #cbd5e1; border-radius: 6px; padding: 12px; margin-top: 10px; background: #fff; }
+    .badge { background: #dbeafe; color: #1e40af; font-size: 0.75rem; padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h2>Dynamic Batch Planner</h2>
+
+  <!-- Step 1: Batch URL Input -->
+  <div class="form-group">
+    <label for="batchUrl">Paste Batch URL</label>
+    <input type="url" id="batchUrl" placeholder="https://academy.test/batches/jee-phys-mechanics-2026" />
+    <button onclick="previewCurriculum()">Import Curriculum</button>
+  </div>
+
+  <div id="errorContainer" class="error-box" style="display: none;"></div>
+
+  <!-- Step 2: Preview Chapters/Topics -->
+  <div id="previewContainer" class="card" style="display: none;">
+    <h3 id="curriculumTitle"></h3>
+    <p>Target Exam: <span id="targetExam" class="badge"></span> | Total Chapters: <strong id="totalChapters"></strong> | Total Topics: <strong id="totalTopics"></strong></p>
+    <div id="chapterList"></div>
+
+    <!-- Step 3: Choose Duration -->
+    <div class="form-group" style="margin-top: 1.5rem;">
+      <label for="durationSelect">Choose Plan Duration (Days):</label>
+      <select id="durationSelect">
+        <option value="30">30 Days</option>
+        <option value="45">45 Days</option>
+        <option value="60">60 Days</option>
+        <option value="75">75 Days</option>
+        <option value="90">90 Days</option>
+        <option value="120">120 Days</option>
+        <option value="150">150 Days</option>
+      </select>
+      <button onclick="generatePlan()">Generate 4-Slot Daily Plan</button>
+    </div>
+  </div>
+
+  <!-- Step 4: Daily Four Slots Grid Preview & Saved State -->
+  <div id="planContainer" style="display: none; margin-top: 2rem;">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+      <h3 id="planTitle"></h3>
+      <span id="savedPlanIdBadge" class="badge" style="cursor: pointer;" onclick="copyPlanId()"></span>
+    </div>
+    <div id="daysList"></div>
+  </div>
+</div>
+
+<script>
+  let loadedUrl = "";
+
+  async function previewCurriculum() {
+    hideError();
+    const url = document.getElementById("batchUrl").value.trim();
+    if (!url) return showError("Please enter a valid Batch URL.");
+
+    try {
+      const res = await fetch("/api/planner/preview/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ batch_url: url })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showError(data.message + " (" + (data.error_code || "ERROR") + ")");
+        document.getElementById("previewContainer").style.display = "none";
+        return;
+      }
+      loadedUrl = url;
+      renderPreview(data.data);
+    } catch (err) {
+      showError("Network error or server unreachable.");
+    }
+  }
+
+  function renderPreview(data) {
+    document.getElementById("curriculumTitle").innerText = data.curriculum_title;
+    document.getElementById("targetExam").innerText = data.target_exam;
+    document.getElementById("totalChapters").innerText = data.total_chapters;
+    document.getElementById("totalTopics").innerText = data.total_topics;
+
+    let chaptersHtml = "<ul>";
+    data.chapters.forEach(ch => {
+      chaptersHtml += `<li><strong>${ch.chapter_name}</strong>: ${ch.topics.join(", ")}</li>`;
+    });
+    chaptersHtml += "</ul>";
+    document.getElementById("chapterList").innerHTML = chaptersHtml;
+    document.getElementById("previewContainer").style.display = "block";
+  }
+
+  async function generatePlan() {
+    hideError();
+    const duration = parseInt(document.getElementById("durationSelect").value, 10);
+    try {
+      const res = await fetch("/api/planner/generate/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ batch_url: loadedUrl, duration_days: duration })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return showError(data.message || "Failed to generate plan.");
+      }
+      renderPlan(data.plan);
+    } catch (err) {
+      showError("Failed to save and generate plan.");
+    }
+  }
+
+  function renderPlan(plan) {
+    document.getElementById("planTitle").innerText = `${plan.title} (${plan.duration_days} Days)`;
+    document.getElementById("savedPlanIdBadge").innerText = `Saved Plan ID: ${plan.id}`;
+
+    let daysHtml = "";
+    plan.days.forEach(d => {
+      daysHtml += `
+        <div class="day-block">
+          <div style="font-weight: 700; color: #1e3a8a;">Day ${d.day_number}: ${d.focus_topic} <span style="font-size: 0.8rem; font-weight: normal; color: #475569;">(${d.focus_chapter})</span></div>
+          <div class="slot-grid">
+            ${d.slots.map(s => `
+              <div class="slot-card">
+                <div class="slot-title">${s.title}</div>
+                <div style="font-size: 0.75rem; color: #64748b;">${s.allocated_minutes} Mins</div>
+                <ul style="padding-left: 14px; margin-top: 4px; font-size: 0.78rem;">
+                  ${s.planned_tasks.map(t => `<li>${t}</li>`).join("")}
+                </ul>
+              </div>
+            `).join("")}
+          </div>
+        </div>
+      `;
+    });
+    document.getElementById("daysList").innerHTML = daysHtml;
+    document.getElementById("planContainer").style.display = "block";
+  }
+
+  function showError(msg) {
+    const box = document.getElementById("errorContainer");
+    box.innerText = msg;
+    box.style.display = "block";
+  }
+
+  function hideError() {
+    document.getElementById("errorContainer").style.display = "none";
+  }
+
+  function copyPlanId() {
+    const badge = document.getElementById("savedPlanIdBadge");
+    const id = badge.innerText.replace("Saved Plan ID: ", "");
+    navigator.clipboard.writeText(id);
+    alert("Copied Plan UUID to clipboard: " + id);
+  }
+</script>
+</body>
+</html>

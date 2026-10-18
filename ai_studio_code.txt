@@ -1,0 +1,76 @@
+{
+  "curricula": {
+    "jee-phys-mechanics-2026": {
+      "batch_identifier": "jee-phys-mechanics-2026",
+      "curriculum_title": "JEE Advanced Physics Mechanics & Thermal",
+      "target_exam": "JEE Advanced",
+      "allowed_url_patterns": [
+        "^https?:\\/\\/(www\\.)?academy\\.test\\/batches\\/jee-phys-mechanics-2026(\\/?|\\?.*)$",
+        "^https?:\\/\\/(www\\.)?institutes\\.test\\/portal\\/p\\/jee-phys-mechanics-2026$"
+      ],
+      "chapters": [
+        {
+          "chapter_name": "Kinematics & Vectors",
+          "topics": [
+            "Rectilinear Motion & Calculus Derivations",
+            "Projectile Motion on Incline",
+            "Relative Velocity & River Swimmer Problems"
+          ]
+        },
+        {
+          "chapter_name": "Laws of Motion & Friction",
+          "topics": [
+            "Constraint Relations & Pseudo Force",
+            "Friction on Incline & Two Block Problems",
+            "Circular Dynamics & Banking of Roads"
+          ]
+        },
+        {
+          "chapter_name": "Work, Energy & Power",
+          "topics": [
+            "Work-Kinetic Energy Theorem & Conservative Fields",
+            "Vertical Circular Motion",
+            "Potential Energy Curves & Stability Analysis"
+          ]
+        },
+        {
+          "chapter_name": "System of Particles & Rotational Dynamics",
+          "topics": [
+            "Center of Mass & Impulse Momentum Theorem",
+            "Moment of Inertia Theorems",
+            "Torque Equilibrium & Fixed Axis Rotation",
+            "Pure Rolling & Slipping Friction"
+          ]
+        }
+      ]
+    },
+    "neet-bio-genetics-2026": {
+      "batch_identifier": "neet-bio-genetics-2026",
+      "curriculum_title": "NEET UG Genetics & Molecular Biology",
+      "target_exam": "NEET UG",
+      "allowed_url_patterns": [
+        "^https?:\\/\\/(www\\.)?academy\\.test\\/batches\\/neet-bio-genetics-2026(\\/?|\\?.*)$"
+      ],
+      "chapters": [
+        {
+          "chapter_name": "Principles of Inheritance and Variation",
+          "topics": [
+            "Mendelian Laws & Dihybrid Cross Ratios",
+            "Incomplete Dominance & Multiple Allelism",
+            "Linkage and Genetic Recombination Maps",
+            "Chromosomal Disorders & Pedigree Analysis"
+          ]
+        },
+        {
+          "chapter_name": "Molecular Basis of Inheritance",
+          "topics": [
+            "DNA Structure, Packaging & Nucleosome Model",
+            "Replication Machinery & Meselson-Stahl Experiment",
+            "Transcription and Post-Transcriptional Processing",
+            "Genetic Code, Translation & Lac Operon"
+          ]
+        }
+      ]
+    }
+  }
+}
