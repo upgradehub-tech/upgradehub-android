@@ -1,0 +1,200 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Subject {
+  PHYSICS
+  CHEMISTRY
+  BIOLOGY
+  MATHEMATICS
+}
+
+enum StepType {
+  LECTURE_TRACKING
+  THEORY_NOTES
+  NCERT_LINE_BY_LINE
+  LEVEL_1_PYQS
+  ADVANCED_PROBLEM_SET
+  MISTAKE_NOTEBOOK_ENTRY
+  SHORT_NOTES
+  FORMULA_RECALL
+  CBT_UNIT_TEST
+}
+
+enum StepStatus {
+  LOCKED
+  AVAILABLE
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum MistakeTag {
+  CONCEPTUAL_GAP
+  CALCULATION_ERROR
+  QUESTION_MISREAD
+  REACTION_EXCEPTION_FORGOTTEN
+  FORMULA_SUBSTITUTION_ERROR
+  TIME_PRESSURE
+}
+
+model Chapter {
+  id              String           @id @default(uuid())
+  code            String           @unique // e.g. "CHEM-12-08"
+  title           String
+  subject         Subject
+  classGrade      Int              // 11 or 12
+  syllabusWeight  Float            @default(1.0)
+  topics          Topic[]
+  ncertTables     NCERTTable[]
+  ncertGraphs     NCERTGraph[]
+  ncertExceptions NCERTException[]
+  ncertDrills     NCERTDrillQuestion[]
+  userTrackers    ChapterTracker[]
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+}
+
+model Topic {
+  id              String   @id @default(uuid())
+  chapterId       String
+  chapter         Chapter  @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  sequenceOrder   Int
+  title           String
+  ncertPageStart  Int
+  ncertPageEnd    Int
+  createdAt       DateTime @default(now())
+}
+
+model ChapterTracker {
+  id                 String              @id @default(uuid())
+  userId             String
+  chapterId          String
+  chapter            Chapter             @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  currentStep        StepType            @default(LECTURE_TRACKING)
+  overallProgressPct Float               @default(0.0)
+  masteryScore       Float               @default(0.0)
+  isMastered         Boolean             @default(false)
+  stepStates         ChapterStepState[]
+  lectureProgress    LectureLog[]
+  mistakeEntries     MistakeNotebookEntry[]
+  cbtSubmissions     CbtUnitSubmission[]
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  @@unique([userId, chapterId])
+  @@index([userId, currentStep])
+}
+
+model ChapterStepState {
+  id           String         @id @default(uuid())
+  trackerId    String
+  tracker      ChapterTracker @relation(fields: [trackerId], references: [id], onDelete: Cascade)
+  step         StepType
+  status       StepStatus     @default(LOCKED)
+  scorePct     Float?
+  metadata     Json           @default("{}") // Custom payload per step
+  completedAt  DateTime?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  @@unique([trackerId, step])
+  @@index([trackerId, status])
+}
+
+// Lecture tracker stores only lecture progress metadata, no video files or hosting
+model LectureLog {
+  id              String         @id @default(uuid())
+  trackerId       String
+  tracker         ChapterTracker @relation(fields: [trackerId], references: [id], onDelete: Cascade)
+  lectureIndex    Int
+  title           String
+  externalRefCode String?        // e.g. "LEC-01", teacher reference
+  durationMinutes Int
+  isCompleted     Boolean        @default(false)
+  watchedMinutes  Int            @default(0)
+  notesSummary    String?
+  completedAt     DateTime?
+
+  @@unique([trackerId, lectureIndex])
+}
+
+// NCERT Command Center entities
+model NCERTTable {
+  id            String   @id @default(uuid())
+  chapterId     String
+  chapter       Chapter  @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  tableNumber   String   // e.g. "Table 8.2"
+  title         String
+  pageNumber    Int
+  keyTakeaways  String[]
+  activeRecallPrompt String
+}
+
+model NCERTGraph {
+  id            String   @id @default(uuid())
+  chapterId     String
+  chapter       Chapter  @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  figureNumber  String   // e.g. "Fig. 8.4"
+  title         String
+  pageNumber    Int
+  xAxisLabel    String
+  yAxisLabel    String
+  inflectionPointNote String
+  activeRecallPrompt  String
+}
+
+model NCERTException {
+  id               String   @id @default(uuid())
+  chapterId        String
+  chapter          Chapter  @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  topicName        String
+  standardTrend    String
+  exceptionRule    String
+  ncertReference   String   // e.g. "Page 234, Paragraph 2"
+  reason           String
+  frequentTrapNote String
+}
+
+model NCERTDrillQuestion {
+  id            String   @id @default(uuid())
+  chapterId     String
+  chapter       Chapter  @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  ncertPageRef  Int
+  lineReference String
+  questionText  String
+  correctAnswer String
+  explanation   String
+  drillType     String   // "FILL_IN_BLANK", "ASSERTION_REASON", "STATEMENT_CHECK"
+}
+
+model MistakeNotebookEntry {
+  id               String      @id @default(uuid())
+  trackerId        String
+  tracker          ChapterTracker @relation(fields: [trackerId], references: [id], onDelete: Cascade)
+  stepEncountered  StepType
+  questionRefId    String
+  questionSnippet  String
+  studentWrongWork String
+  correctSolution  String
+  mistakeTag       MistakeTag
+  ncertCorrectionRef String?
+  isRemediated     Boolean     @default(false)
+  createdAt        DateTime    @default(now())
+}
+
+model CbtUnitSubmission {
+  id            String         @id @default(uuid())
+  trackerId     String
+  tracker       ChapterTracker @relation(fields: [trackerId], references: [id], onDelete: Cascade)
+  totalMarks    Float
+  marksObtained Float
+  accuracyPct   Float
+  durationSec   Int
+  passed        Boolean
+  completedAt   DateTime       @default(now())
+}
