@@ -1,0 +1,202 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ---------------------------------------------------------
+// Existing User Model Anchor
+// ---------------------------------------------------------
+model User {
+  id                    String                 @id @default(uuid())
+  email                 String                 @unique
+  name                  String?
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+
+  // Life OS Relations
+  tasks                 Task[]
+  financialCategories   FinancialCategory[]
+  financialTransactions FinancialTransaction[]
+  habits                Habit[]
+  habitLogs             HabitLog[]
+  hydrationLogs         HydrationLog[]
+  sleepLogs             SleepLog[]
+  screenBreakLogs       ScreenBreakLog[]
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------
+// 1. Task Management & Eisenhower Matrix
+// ---------------------------------------------------------
+enum TaskStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum EisenhowerQuadrant {
+  Q1_DO_FIRST       // Urgent & Important
+  Q2_SCHEDULE       // Not Urgent & Important
+  Q3_DELEGATE       // Urgent & Not Important
+  Q4_ELIMINATE      // Not Urgent & Not Important
+}
+
+model Task {
+  id               String              @id @default(uuid())
+  userId           String              @map("user_id")
+  title            String              @db.VarChar(255)
+  description      String?             @db.Text
+  isUrgent         Boolean             @default(false) @map("is_urgent")
+  isImportant      Boolean             @default(false) @map("is_important")
+  quadrant         EisenhowerQuadrant  @map("quadrant")
+  status           TaskStatus          @default(PENDING)
+  estimatedMinutes Int?                @map("estimated_minutes")
+  dueDate          DateTime?           @map("due_date")
+  completedAt      DateTime?           @map("completed_at")
+  createdAt        DateTime            @default(now()) @map("created_at")
+  updatedAt        DateTime            @updatedAt @map("updated_at")
+
+  user             User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([userId, quadrant])
+  @@map("life_os_tasks")
+}
+
+// ---------------------------------------------------------
+// 2. Student Finance Ledger
+// ---------------------------------------------------------
+enum TransactionType {
+  INCOME
+  EXPENSE
+}
+
+model FinancialCategory {
+  id               String                 @id @default(uuid())
+  userId           String                 @map("user_id")
+  name             String                 @db.VarChar(64)
+  type             TransactionType
+  monthlyBudgetCap Decimal?               @map("monthly_budget_cap") @db.Decimal(12, 2)
+  colorHex         String?                @default("#4F46E5") @map("color_hex") @db.VarChar(7)
+  createdAt        DateTime               @default(now()) @map("created_at")
+
+  user             User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions     FinancialTransaction[]
+
+  @@unique([userId, name, type])
+  @@map("life_os_financial_categories")
+}
+
+model FinancialTransaction {
+  id              String            @id @default(uuid())
+  userId          String            @map("user_id")
+  categoryId      String            @map("category_id")
+  type            TransactionType
+  amount          Decimal           @db.Decimal(12, 2)
+  description     String            @db.VarChar(255)
+  transactionDate DateTime          @map("transaction_date") @db.Date
+  createdAt       DateTime          @default(now()) @map("created_at")
+
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category        FinancialCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@index([userId, transactionDate])
+  @@index([userId, categoryId])
+  @@map("life_os_financial_transactions")
+}
+
+// ---------------------------------------------------------
+// 3. Atomic Habits & Streaks
+// ---------------------------------------------------------
+enum HabitFrequency {
+  DAILY
+  WEEKLY
+}
+
+model Habit {
+  id            String         @id @default(uuid())
+  userId        String         @map("user_id")
+  name          String         @db.VarChar(128)
+  description   String?        @db.VarChar(255)
+  frequency     HabitFrequency @default(DAILY)
+  currentStreak Int            @default(0) @map("current_streak")
+  longestStreak Int            @default(0) @map("longest_streak")
+  isArchived    Boolean        @default(false) @map("is_archived")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  logs          HabitLog[]
+
+  @@index([userId, isArchived])
+  @@map("life_os_habits")
+}
+
+model HabitLog {
+  id            String   @id @default(uuid())
+  habitId       String   @map("habit_id")
+  userId        String   @map("user_id")
+  completedDate DateTime @map("completed_date") @db.Date
+  notes         String?  @db.VarChar(255)
+  loggedAt      DateTime @default(now()) @map("logged_at")
+
+  habit         Habit    @relation(fields: [habitId], references: [id], onDelete: Cascade)
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([habitId, completedDate])
+  @@index([userId, completedDate])
+  @@map("life_os_habit_logs")
+}
+
+// ---------------------------------------------------------
+// 4. Wellness Tracking
+// ---------------------------------------------------------
+model HydrationLog {
+  id          String   @id @default(uuid())
+  userId      String   @map("user_id")
+  logDate     DateTime @map("log_date") @db.Date
+  amountMl    Int      @map("amount_ml")
+  targetMl    Int      @default(2500) @map("target_ml")
+  recordedAt  DateTime @default(now()) @map("recorded_at")
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, logDate])
+  @@map("life_os_hydration_logs")
+}
+
+model SleepLog {
+  id              String   @id @default(uuid())
+  userId          String   @map("user_id")
+  bedtime         DateTime @map("bedtime")
+  wakeTime        DateTime @map("wake_time")
+  durationMinutes Int      @map("duration_minutes")
+  qualityScore    Int      @map("quality_score") // 1 (poor) to 5 (excellent)
+  notes           String?  @db.VarChar(255)
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, bedtime])
+  @@map("life_os_sleep_logs")
+}
+
+model ScreenBreakLog {
+  id              String   @id @default(uuid())
+  userId          String   @map("user_id")
+  breakStartedAt  DateTime @map("break_started_at")
+  durationMinutes Int      @map("duration_minutes")
+  activityNote    String?  @map("activity_note") @db.VarChar(128)
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, breakStartedAt])
+  @@map("life_os_screen_break_logs")
+}

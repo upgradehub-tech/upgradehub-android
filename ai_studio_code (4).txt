@@ -1,0 +1,24 @@
+src/
+├── database/
+│   ├── schema.prisma                       # Extended Prisma Schema
+│   └── migrations/20261020_life_os_init/
+│       └── migration.sql                   # Raw PostgreSQL Migration
+├── modules/life-os/
+│   ├── types.ts                            # Domain enums & interfaces
+│   ├── tasks/
+│   │   └── taskMatrix.service.ts           # Eisenhower matrix & status engine
+│   ├── finance/
+│   │   └── financeLedger.service.ts        # Budget variance, net balance & ledger
+│   ├── habits/
+│   │   └── habitStreak.service.ts          # Deterministic streak calculation engine
+│   └── wellness/
+│       └── wellness.service.ts             # Hydration, sleep & screen break metrics
+├── seeds/
+│   └── seed-life-os.ts                     # Realistic student seed fixtures
+tests/
+├── unit/
+│   ├── taskMatrix.spec.ts
+│   ├── financeLedger.spec.ts
+│   └── habitStreak.spec.ts
+└── integration/
+    └── lifeOsIntegration.spec.ts
