@@ -1,0 +1,184 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  STUDENT
+  ADMIN
+}
+
+enum ReferralStatus {
+  PENDING
+  COMPLETED
+  DISQUALIFIED
+}
+
+enum RewardStatus {
+  LOCKED
+  CLAIMABLE
+  CLAIMED
+}
+
+enum LedgerType {
+  CREDIT
+  DEBIT
+}
+
+enum ResourceType {
+  STUDY_NOTE
+  CONCEPT_FORMULA
+  PRACTICE_SHEET
+  MIND_MAP
+}
+
+model User {
+  id               String            @id @default(uuid())
+  email            String            @unique
+  name             String?
+  avatarUrl        String?
+  role             Role              @default(STUDENT)
+  isEmailVerified  Boolean           @default(false)
+  referralCode     String            @unique
+  referredById     String?
+  referredBy       User?             @relation("UserReferrals", fields: [referredById], references: [id], onDelete: SetNull)
+  referralsMade    User[]            @relation("UserReferrals")
+  
+  referralRecords  Referral[]        @relation("ReferrerRelation")
+  referredRecords  Referral[]        @relation("RefereeRelation")
+  referralRewards  ReferralReward[]
+  wallet           Wallet?
+  auditLogs        AdminAuditLog[]
+
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  @@index([email])
+  @@index([referralCode])
+}
+
+model Referral {
+  id           String         @id @default(uuid())
+  referrerId   String
+  referrer     User           @relation("ReferrerRelation", fields: [referrerId], references: [id], onDelete: Cascade)
+  refereeId    String         @unique
+  referee      User           @relation("RefereeRelation", fields: [refereeId], references: [id], onDelete: Cascade)
+  status       ReferralStatus @default(PENDING)
+  milestoneId  String?
+  milestone    ReferralReward? @relation(fields: [milestoneId], references: [id], onDelete: SetNull)
+  completedAt  DateTime?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  @@index([referrerId, status])
+}
+
+model ReferralReward {
+  id               String       @id @default(uuid())
+  userId           String
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  milestoneNumber  Int          // e.g., 1 for 10th referral, 2 for 20th referral
+  requiredCount    Int          @default(10)
+  rewardAmount     Decimal      @default(100.00) @db.Decimal(10, 2)
+  status           RewardStatus @default(CLAIMABLE)
+  unlockedAt       DateTime     @default(now())
+  claimedAt        DateTime?
+  referrals        Referral[]
+  ledgerEntryId    String?      @unique
+  ledgerEntry      WalletLedger?
+
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@unique([userId, milestoneNumber])
+  @@index([userId, status])
+}
+
+model Wallet {
+  id        String         @id @default(uuid())
+  userId    String         @unique
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance   Decimal        @default(0.00) @db.Decimal(10, 2)
+  ledgers   WalletLedger[]
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+}
+
+model WalletLedger {
+  id          String          @id @default(uuid())
+  walletId    String
+  wallet      Wallet          @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  type        LedgerType
+  amount      Decimal         @db.Decimal(10, 2)
+  description String
+  rewardId    String?         @unique
+  reward      ReferralReward? @relation(fields: [rewardId], references: [id], onDelete: SetNull)
+  createdAt   DateTime        @default(now())
+
+  @@index([walletId])
+}
+
+model Subject {
+  id          String          @id @default(uuid())
+  name        String          @unique
+  slug        String          @unique
+  iconUrl     String?
+  chapters    Chapter[]
+  resources   ResourceVault[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+}
+
+model Chapter {
+  id          String          @id @default(uuid())
+  name        String
+  chapterNo   Int
+  subjectId   String
+  subject     Subject         @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  resources   ResourceVault[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@unique([subjectId, chapterNo])
+  @@index([subjectId])
+}
+
+model ResourceVault {
+  id           String       @id @default(uuid())
+  title        String
+  description  String?
+  type         ResourceType
+  fileUrl      String
+  thumbnailUrl String?
+  fileSizeBytes BigInt
+  fileExtension String
+  isDownloadable Boolean    @default(true)
+  isPremium    Boolean      @default(false)
+  subjectId    String
+  subject      Subject      @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  chapterId    String
+  chapter      Chapter      @relation(fields: [chapterId], references: [id], onDelete: Restrict)
+  downloads    Int          @default(0)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  @@index([subjectId, chapterId])
+  @@index([type])
+}
+
+model AdminAuditLog {
+  id        String   @id @default(uuid())
+  adminId   String
+  admin     User     @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  action    String
+  targetId  String?
+  payload   Json?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([adminId])
+}

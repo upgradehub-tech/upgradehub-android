@@ -1,0 +1,44 @@
+├── backend/
+│   ├── prisma/
+│   │   └── schema.prisma
+│   ├── src/
+│   │   ├── config/
+│   │   │   ├── constants.ts
+│   │   │   └── prisma.ts
+│   │   ├── middleware/
+│   │   │   ├── auth.middleware.ts
+│   │   │   └── admin.middleware.ts
+│   │   ├── services/
+│   │   │   ├── referral.service.ts
+│   │   │   ├── resource.service.ts
+│   │   │   └── admin.service.ts
+│   │   ├── controllers/
+│   │   │   ├── referral.controller.ts
+│   │   │   ├── resource.controller.ts
+│   │   │   └── admin.controller.ts
+│   │   ├── routes/
+│   │   │   ├── referral.routes.ts
+│   │   │   ├── resource.routes.ts
+│   │   │   ├── admin.routes.ts
+│   │   │   └── index.ts
+│   │   ├── app.ts
+│   │   └── server.ts
+│   ├── package.json
+│   └── tsconfig.json
+└── android/
+    └── app/src/main/java/com/lifeos/edtech/
+        ├── data/
+        │   ├── model/
+        │   │   ├── ReferralModels.kt
+        │   │   └── ResourceModels.kt
+        │   └── remote/
+        │       └── LifeOsApiService.kt
+        ├── ui/
+        │   ├── referral/
+        │   │   ├── ReferralViewModel.kt
+        │   │   └── ReferralScreen.kt
+        │   └── resources/
+        │       ├── ResourcesViewModel.kt
+        │       └── ResourcesVaultScreen.kt
+        └── auth/
+            └── SessionManager.kt

@@ -1,0 +1,3 @@
+DATABASE_URL="postgresql://user:password@localhost:5432/lifeos_db?schema=public"
+JWT_SECRET="YOUR_HIGH_ENTROPY_PRODUCTION_JWT_SECRET"
+ADMIN_GMAIL_WHITELIST="director.lifeos@gmail.com,operations.edtech@gmail.com"
