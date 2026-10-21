@@ -1,0 +1,18 @@
+                      ┌──────────────────────────────────────────────┐
+                      │                Practice Stack                │
+                      │  - Chapter/Topic Queue & Evaluation          │
+                      └──────────────┬───────────────────┬───────────┘
+                                     │ (Correct)         │ (Incorrect)
+                                     ▼                   ▼
+                      ┌──────────────────────┐  ┌────────────────────┐
+                      │ Chapter Progress     │  │  Mistake Notebook  │
+                      │ - Accuracy           │  │  - Mistake Tags    │
+                      │ - Open Mistake Drag  │  │  - Edit/Reopen     │
+                      │ - SRS Retention      │  └────────┬───────────┘
+                      └──────────▲───────────┘           │
+                                 │                       ▼ (Generate Card)
+                                 │              ┌────────────────────┐
+                                 │              │    Flashcards      │
+                                 └──────────────┤  - SM-2 Scheduler  │
+                                   (Reviews)    │  - Review States   │
+                                                └────────────────────┘

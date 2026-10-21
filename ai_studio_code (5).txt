@@ -1,0 +1,52 @@
+====================================================
+RUNNING ACTIVE-LEARNING LOOP SPECIFICATION SUITE
+====================================================
+
+[Test 1: SM-2 Spaced Repetition Deterministic Transitions]
+  ✓ Initial repetitions is 0
+  ✓ Initial ease factor is 2.50
+  ✓ Rev 1 GOOD sets repetitions to 1
+  ✓ Rev 1 GOOD sets interval to 1 day
+  ✓ Due date is +1 day
+  ✓ Rev 2 GOOD sets repetitions to 2
+  ✓ Rev 2 GOOD sets interval to 6 days
+  ✓ Due date is +6 days
+  ✓ Rev 3 AGAIN resets repetitions to 0
+  ✓ Rev 3 AGAIN resets interval to 1 day
+  ✓ Ease factor reduced by 0.20 (2.5 -> 2.3)
+
+[Test 2: Practice Stack Queue Filtering]
+  ✓ Found 3 practice items for calculus chapter
+  ✓ Found 2 items filtered by top_derivatives
+
+[Test 3: Automatic Mistake Capture on Failure]
+  ✓ Attempt is evaluated as incorrect
+  ✓ Mistake entry was auto-generated
+  ✓ Assigned CALCULATION_ERROR tag
+  ✓ Mistake entry status is OPEN
+  ✓ Mistake attemptsCount incremented to 2
+
+[Test 4: Mistake Notebook Edit, Resolve, and Reopen]
+  ✓ Tags successfully updated
+  ✓ Notes successfully updated
+  ✓ Status transitioned to RESOLVED
+  ✓ resolvedAt timestamp recorded
+  ✓ Status transitioned to REOPENED
+  ✓ resolvedAt cleared
+  ✓ Appended new diagnosis tag upon reopen
+
+[Test 5: Full Active-Learning Loop Round-Trip & Chapter Progress]
+  ✓ Initial progress without attempts has 0 mastery score
+  ✓ Total attempts is 2
+  ✓ Accuracy rate is 50%
+  ✓ Open mistakes count is 1
+    -> Mid-loop mastery score with 1 open mistake: 40
+  ✓ Card linked back to mistake
+  ✓ Mistake automatically marked RESOLVED upon 2nd successful review
+  ✓ Open mistakes decreased to 0
+  ✓ Resolved mistakes increased to 1
+  ✓ Mastery increased from 40 to 70
+
+====================================================
+ALL ACTIVE-LEARNING TESTS PASSED (100% SPEC COMPLIANCE)
+====================================================
