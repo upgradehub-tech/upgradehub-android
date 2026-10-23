@@ -1,21 +1,31 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# UpgradeHub
 
-# Run and deploy your AI Studio app
+AI Study Coach + Academic Campus & Rewards. Next.js 15, React 19, TypeScript, Tailwind, Supabase Auth, Gemini.
 
-This contains everything you need to run your app locally.
+## Local run
 
-View your app in AI Studio: https://ai.studio/apps/11b982b5-b0f6-4dc9-b7c8-face473ba944
+```bash
+npm install
+cp .env.example .env.local     # keys bharo
+npm run dev                    # http://localhost:3000
+```
 
-## Run Locally
+## Environment variables
 
-**Prerequisites:**  [Android Studio](https://developer.android.com/studio)
+| Variable | Kahan | Note |
+|---|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | browser + server | public |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | browser + server | public, RLS se secure |
+| `GEMINI_API_KEY` | **sirf server** | secret, `NEXT_PUBLIC_` kabhi nahi |
+| `GEMINI_MODEL` | sirf server | default `gemini-flash-latest` |
 
+## Security model
 
-1. Open Android Studio
-2. Select **Open** and choose the directory containing this project
-3. Allow Android Studio to fix any incompatibilities as it imports the project.
-4. Create a file named `.env` in the project directory and set `GEMINI_API_KEY` in that file to your Gemini API key (see `.env.example` for an example)
-6. Run the app on an emulator or physical device
-7. If you have already published your app in AI Studio, please [request upload key reset](https://support.google.com/googleplay/android-developer/answer/9842756#zippy=%2Crequest-an-upload-key-reset) in Google Play Console.
+- `/api/ai/coach` sirf logged-in Supabase users ke liye hai (Bearer token server par verify hota hai).
+- Per-user rate limit (10 req/min), body size limit, input whitelist/sanitize, Gemini key header mein (URL mein nahi).
+- Database access Row Level Security se: `supabase/migrations/001_init.sql`.
+- `service_role` key is project mein kahin use nahi hoti. Kabhi client code mein mat daalna.
+
+## Deploy
+
+Steps ke liye project ke saath diye gaye deploy guide dekho (GitHub push, Supabase SQL + Auth URL, Vercel env vars).
