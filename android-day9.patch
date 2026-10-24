@@ -1,0 +1,1703 @@
+From 7ca1cee200d379363039fc95956c080bd598d984 Mon Sep 17 00:00:00 2001
+From: UpgradeHub <dev@upgradehub.local>
+Date: Sat, 24 Oct 2026 09:04:12 +0000
+Subject: [PATCH] feat(day-9): device layer - snooze, duplicate-alert guard,
+ haptics/ambient toggles, FCM->Supabase token registry, widget refresh
+
+---
+ .env.example                                  |   3 +
+ app/build.gradle.kts                          |   3 +
+ app/src/main/AndroidManifest.xml              |  12 ++
+ app/src/main/java/com/example/MainActivity.kt |   1 +
+ .../com/example/device/AmbientFocusPlayer.kt  | 136 ++++++++++++++++++
+ .../com/example/device/DeviceAnalytics.kt     |  26 ++++
+ .../com/example/device/DeviceFeedbackPrefs.kt |  59 ++++++++
+ .../java/com/example/device/DeviceLayer.kt    |  51 +++++++
+ .../com/example/device/HapticsController.kt   |  46 ++++++
+ .../java/com/example/device/SlotAlertGuard.kt |  73 ++++++++++
+ .../java/com/example/device/SnoozePolicy.kt   |  25 ++++
+ .../com/example/device/SnoozeScheduler.kt     |  86 +++++++++++
+ .../example/device/SupabaseDeviceRegistry.kt  | 113 +++++++++++++++
+ .../device/fcm/AnnouncementNotifier.kt        |  67 +++++++++
+ .../device/fcm/UpgradeHubMessagingService.kt  |  26 ++++
+ .../ui/components/AmbientFocusHapticsCard.kt  | 134 +++++++++++++++++
+ .../ui/components/NotificationCenterDialog.kt | 129 ++++++++++++++---
+ ...cheduledStudySlotsEmergencyDrillSection.kt |   3 +
+ .../com/example/widget/NextSlotResolver.kt    |  24 ++++
+ .../widget/UpgradeHubStreakWidgetProvider.kt  |  27 ++++
+ .../com/example/widget/WidgetRefreshWorker.kt |  55 +++++++
+ .../com/example/work/StudySlotAlarmWorker.kt  |  17 ++-
+ .../example/work/StudySlotWorkScheduler.kt    |  19 ++-
+ .../example/device/NextSlotResolverTest.kt    |  41 ++++++
+ .../com/example/device/SlotAlertGuardTest.kt  |  62 ++++++++
+ .../com/example/device/SnoozePolicyTest.kt    |  30 ++++
+ gradle/libs.versions.toml                     |   3 +
+ 27 files changed, 1244 insertions(+), 27 deletions(-)
+ create mode 100644 app/src/main/java/com/example/device/AmbientFocusPlayer.kt
+ create mode 100644 app/src/main/java/com/example/device/DeviceAnalytics.kt
+ create mode 100644 app/src/main/java/com/example/device/DeviceFeedbackPrefs.kt
+ create mode 100644 app/src/main/java/com/example/device/DeviceLayer.kt
+ create mode 100644 app/src/main/java/com/example/device/HapticsController.kt
+ create mode 100644 app/src/main/java/com/example/device/SlotAlertGuard.kt
+ create mode 100644 app/src/main/java/com/example/device/SnoozePolicy.kt
+ create mode 100644 app/src/main/java/com/example/device/SnoozeScheduler.kt
+ create mode 100644 app/src/main/java/com/example/device/SupabaseDeviceRegistry.kt
+ create mode 100644 app/src/main/java/com/example/device/fcm/AnnouncementNotifier.kt
+ create mode 100644 app/src/main/java/com/example/device/fcm/UpgradeHubMessagingService.kt
+ create mode 100644 app/src/main/java/com/example/ui/components/AmbientFocusHapticsCard.kt
+ create mode 100644 app/src/main/java/com/example/widget/NextSlotResolver.kt
+ create mode 100644 app/src/main/java/com/example/widget/WidgetRefreshWorker.kt
+ create mode 100644 app/src/test/java/com/example/device/NextSlotResolverTest.kt
+ create mode 100644 app/src/test/java/com/example/device/SlotAlertGuardTest.kt
+ create mode 100644 app/src/test/java/com/example/device/SnoozePolicyTest.kt
+
+diff --git a/.env.example b/.env.example
+index f8cb897..91400c6 100644
+--- a/.env.example
++++ b/.env.example
+@@ -9,3 +9,6 @@
+ # RECAPTCHA_SITE_KEY: Required for Firebase App Check with ReCaptcha Enterprise.
+ # Configured in Google Cloud Console / Firebase App Check console.
+ # RECAPTCHA_SITE_KEY=your_recaptcha_enterprise_site_key
++
++# UPGRADEHUB_API_BASE_URL: HTTPS base URL of the deployed web backend (Vercel). Used to register FCM tokens.
++UPGRADEHUB_API_BASE_URL=https://your-app.vercel.app
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index d58144a..61948f1 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -98,6 +98,9 @@ dependencies {
+   implementation(libs.firebase.ai)
+   implementation(libs.firebase.firestore)
+   implementation(libs.firebase.auth)
++  implementation(libs.firebase.messaging)
++  implementation(libs.firebase.analytics)
++  implementation(libs.firebase.crashlytics)
+   implementation(libs.androidx.credentials)
+   implementation(libs.androidx.credentials.play.services)
+   implementation(libs.googleid)
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index d558ec8..755fed2 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -54,6 +54,18 @@
+                 android:name="android.appwidget.provider"
+                 android:resource="@xml/streak_widget_info" />
+         </receiver>
++
++        <!-- Day 9: FCM delivery only (tokens/roles/data live in Supabase) -->
++        <service
++            android:name=".device.fcm.UpgradeHubMessagingService"
++            android:exported="false">
++            <intent-filter>
++                <action android:name="com.google.firebase.MESSAGING_EVENT" />
++            </intent-filter>
++        </service>
++        <meta-data
++            android:name="com.google.firebase.messaging.default_notification_channel_id"
++            android:value="announcements" />
+     </application>
+ 
+ </manifest>
+diff --git a/app/src/main/java/com/example/MainActivity.kt b/app/src/main/java/com/example/MainActivity.kt
+index 93ebbf4..d6a6404 100644
+--- a/app/src/main/java/com/example/MainActivity.kt
++++ b/app/src/main/java/com/example/MainActivity.kt
+@@ -398,6 +398,7 @@ fun JeeAppContent(
+     LaunchedEffect(Unit) {
+         val appCtx = currentView.context.applicationContext
+         StudySlotAlarmManager.ensureInitialized(appCtx)
++        com.example.device.DeviceLayer.initialize(appCtx)
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+             if (ContextCompat.checkSelfPermission(appCtx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+diff --git a/app/src/main/java/com/example/device/AmbientFocusPlayer.kt b/app/src/main/java/com/example/device/AmbientFocusPlayer.kt
+new file mode 100644
+index 0000000..307bbc4
+--- /dev/null
++++ b/app/src/main/java/com/example/device/AmbientFocusPlayer.kt
+@@ -0,0 +1,136 @@
++package com.example.device
++
++import android.content.Context
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioTrack
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import java.util.Random
++
++/**
++ * Procedurally generated brown-noise "ambient focus" sound (no audio asset needed, works offline).
++ * Pauses automatically while the 30-second study-slot alarm rings and resumes afterwards.
++ */
++object AmbientFocusPlayer {
++    private const val SAMPLE_RATE = 22050
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++
++    private var job: Job? = null
++    @Volatile private var track: AudioTrack? = null
++    @Volatile private var shouldResume = false
++    @Volatile private var appContext: Context? = null
++
++    private val _playing = MutableStateFlow(false)
++    val isPlaying: StateFlow<Boolean> = _playing.asStateFlow()
++
++    @Synchronized
++    fun start(context: Context): Boolean {
++        DeviceFeedbackPrefs.ensureInitialized(context)
++        if (!DeviceFeedbackPrefs.ambientEnabled.value) return false
++        if (job?.isActive == true) return true
++
++        val minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
++        if (minBuf <= 0) return false
++
++        val t = try {
++            AudioTrack.Builder()
++                .setAudioAttributes(
++                    AudioAttributes.Builder()
++                        .setUsage(AudioAttributes.USAGE_MEDIA)
++                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
++                        .build()
++                )
++                .setAudioFormat(
++                    AudioFormat.Builder()
++                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                        .setSampleRate(SAMPLE_RATE)
++                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
++                        .build()
++                )
++                .setBufferSizeInBytes(minBuf.coerceAtLeast(SAMPLE_RATE / 2))
++                .setTransferMode(AudioTrack.MODE_STREAM)
++                .build()
++        } catch (_: Exception) {
++            return false
++        }
++        if (t.state != AudioTrack.STATE_INITIALIZED) {
++            try { t.release() } catch (_: Exception) { }
++            return false
++        }
++
++        track = t
++        applyVolume()
++        try { t.play() } catch (_: Exception) { return false }
++        _playing.value = true
++
++        job = scope.launch {
++            val buf = ShortArray(SAMPLE_RATE / 4)
++            val rnd = Random()
++            var last = 0.0
++            try {
++                while (isActive) {
++                    for (i in buf.indices) {
++                        val white = rnd.nextDouble() * 2.0 - 1.0
++                        last = (last + 0.02 * white) / 1.02          // brown noise
++                        buf[i] = (last * 3.5 * Short.MAX_VALUE * 0.5).toInt()
++                            .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
++                    }
++                    if (t.write(buf, 0, buf.size) < 0) break
++                }
++            } catch (_: Exception) {
++            } finally {
++                try { t.release() } catch (_: Exception) { }
++                if (track === t) track = null
++                _playing.value = false
++            }
++        }
++        return true
++    }
++
++    @Synchronized
++    fun stop() {
++        val t = track
++        track = null
++        job?.cancel()
++        job = null
++        try { t?.stop() } catch (_: Exception) { }   // unblocks a pending write()
++        _playing.value = false
++    }
++
++    fun applyVolume() {
++        val v = (DeviceFeedbackPrefs.ambientVolume.value / 100f).coerceIn(0f, 1f) * 0.6f
++        try { track?.setVolume(v) } catch (_: Exception) { }
++    }
++
++    /** Called when the alarm siren starts. */
++    @Synchronized
++    fun suspendForAlarm(context: Context) {
++        if (job?.isActive == true) {
++            appContext = context.applicationContext
++            shouldResume = true
++            stop()
++        }
++    }
++
++    /** Called when the alarm stops. [isAlarmActive] guards against a back-to-back alarm restart. */
++    fun resumeAfterAlarm(isAlarmActive: () -> Boolean) {
++        if (!shouldResume) return
++        val app = appContext ?: return
++        scope.launch {
++            delay(600)
++            if (shouldResume && !isAlarmActive()) {
++                shouldResume = false
++                start(app)
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/example/device/DeviceAnalytics.kt b/app/src/main/java/com/example/device/DeviceAnalytics.kt
+new file mode 100644
+index 0000000..3ec25e5
+--- /dev/null
++++ b/app/src/main/java/com/example/device/DeviceAnalytics.kt
+@@ -0,0 +1,26 @@
++package com.example.device
++
++import android.content.Context
++import android.os.Bundle
++import com.google.firebase.analytics.FirebaseAnalytics
++import com.google.firebase.crashlytics.FirebaseCrashlytics
++
++/**
++ * Firebase is used ONLY for mobile telemetry (Analytics + Crashlytics) and FCM.
++ * Source of truth for users/data/roles = Supabase. Never put PII in params.
++ * Safe no-op if google-services.json is missing.
++ */
++object DeviceAnalytics {
++    fun log(context: Context, event: String, params: Map<String, String> = emptyMap()) {
++        try {
++            val b = Bundle()
++            params.forEach { (k, v) -> b.putString(k.take(40), v.take(100)) }
++            FirebaseAnalytics.getInstance(context.applicationContext).logEvent(event.take(40), b)
++        } catch (_: Throwable) {
++        }
++    }
++
++    fun recordNonFatal(t: Throwable) {
++        try { FirebaseCrashlytics.getInstance().recordException(t) } catch (_: Throwable) { }
++    }
++}
+diff --git a/app/src/main/java/com/example/device/DeviceFeedbackPrefs.kt b/app/src/main/java/com/example/device/DeviceFeedbackPrefs.kt
+new file mode 100644
+index 0000000..76ee717
+--- /dev/null
++++ b/app/src/main/java/com/example/device/DeviceFeedbackPrefs.kt
+@@ -0,0 +1,59 @@
++package com.example.device
++
++import android.content.Context
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/** User toggles for the study environment: haptics + ambient focus sound. */
++object DeviceFeedbackPrefs {
++    private const val PREFS = "upgrade_hub_device_feedback"
++    private const val K_HAPTICS = "haptics_enabled"
++    private const val K_AMBIENT = "ambient_enabled"
++    private const val K_VOLUME = "ambient_volume"
++
++    private val _hapticsEnabled = MutableStateFlow(true)   // default = existing behaviour (drill vibrates)
++    val hapticsEnabled: StateFlow<Boolean> = _hapticsEnabled.asStateFlow()
++
++    private val _ambientEnabled = MutableStateFlow(false)
++    val ambientEnabled: StateFlow<Boolean> = _ambientEnabled.asStateFlow()
++
++    private val _ambientVolume = MutableStateFlow(40)
++    val ambientVolume: StateFlow<Int> = _ambientVolume.asStateFlow()
++
++    @Volatile private var initialized = false
++
++    @Synchronized
++    fun ensureInitialized(context: Context) {
++        if (initialized) return
++        val p = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        _hapticsEnabled.value = p.getBoolean(K_HAPTICS, true)
++        _ambientEnabled.value = p.getBoolean(K_AMBIENT, false)
++        _ambientVolume.value = p.getInt(K_VOLUME, 40).coerceIn(0, 100)
++        initialized = true
++    }
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    fun setHapticsEnabled(context: Context, enabled: Boolean) {
++        ensureInitialized(context)
++        prefs(context).edit().putBoolean(K_HAPTICS, enabled).apply()
++        _hapticsEnabled.value = enabled
++    }
++
++    fun setAmbientEnabled(context: Context, enabled: Boolean) {
++        ensureInitialized(context)
++        prefs(context).edit().putBoolean(K_AMBIENT, enabled).apply()
++        _ambientEnabled.value = enabled
++        if (enabled) AmbientFocusPlayer.start(context) else AmbientFocusPlayer.stop()
++    }
++
++    fun setAmbientVolume(context: Context, percent: Int) {
++        ensureInitialized(context)
++        val v = percent.coerceIn(0, 100)
++        prefs(context).edit().putInt(K_VOLUME, v).apply()
++        _ambientVolume.value = v
++        AmbientFocusPlayer.applyVolume()
++    }
++}
+diff --git a/app/src/main/java/com/example/device/DeviceLayer.kt b/app/src/main/java/com/example/device/DeviceLayer.kt
+new file mode 100644
+index 0000000..1a7c629
+--- /dev/null
++++ b/app/src/main/java/com/example/device/DeviceLayer.kt
+@@ -0,0 +1,51 @@
++package com.example.device
++
++import android.appwidget.AppWidgetManager
++import android.content.ComponentName
++import android.content.Context
++import com.example.device.fcm.AnnouncementNotifier
++import com.example.widget.UpgradeHubStreakWidgetProvider
++import com.example.widget.WidgetRefreshScheduler
++import com.google.firebase.messaging.FirebaseMessaging
++
++/** One call from MainActivity: wires guards, channels, widget refresh and FCM token registration. */
++object DeviceLayer {
++    @Volatile private var slotGuardInstance: SlotAlertGuard? = null
++    @Volatile private var fcmGuardInstance: SlotAlertGuard? = null
++
++    fun slotGuard(context: Context): SlotAlertGuard =
++        slotGuardInstance ?: synchronized(this) {
++            slotGuardInstance ?: SlotAlertGuard(PrefsKeyValueStore(context, "upgrade_hub_alert_guard")).also { slotGuardInstance = it }
++        }
++
++    /** 24h window: the same announcement never notifies twice on a device. */
++    fun fcmGuard(context: Context): SlotAlertGuard =
++        fcmGuardInstance ?: synchronized(this) {
++            fcmGuardInstance ?: SlotAlertGuard(
++                PrefsKeyValueStore(context, "upgrade_hub_fcm_guard"),
++                windowMs = 24L * 60 * 60 * 1000,
++                maxKeys = 200
++            ).also { fcmGuardInstance = it }
++        }
++
++    fun initialize(context: Context) {
++        val app = context.applicationContext
++        DeviceFeedbackPrefs.ensureInitialized(app)
++        AnnouncementNotifier.ensureChannel(app)
++        try {
++            val ids = AppWidgetManager.getInstance(app)
++                .getAppWidgetIds(ComponentName(app, UpgradeHubStreakWidgetProvider::class.java))
++            if (ids.isNotEmpty()) WidgetRefreshScheduler.schedulePeriodic(app)
++        } catch (_: Exception) {
++        }
++        SupabaseDeviceRegistry.scheduleSync(app)   // retry a pending token (e.g. registered before login)
++        try {
++            FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
++                if (!token.isNullOrBlank()) SupabaseDeviceRegistry.onNewToken(app, token)
++            }
++        } catch (_: Throwable) {
++            // Firebase not configured (no google-services.json): push disabled, rest of the app unaffected
++        }
++        if (DeviceFeedbackPrefs.ambientEnabled.value) AmbientFocusPlayer.start(app)
++    }
++}
+diff --git a/app/src/main/java/com/example/device/HapticsController.kt b/app/src/main/java/com/example/device/HapticsController.kt
+new file mode 100644
+index 0000000..c78ad82
+--- /dev/null
++++ b/app/src/main/java/com/example/device/HapticsController.kt
+@@ -0,0 +1,46 @@
++package com.example.device
++
++import android.content.Context
++import android.os.Build
++import android.os.VibrationEffect
++import android.os.Vibrator
++import android.os.VibratorManager
++
++/** Single entry point for vibration so the Haptics toggle is respected everywhere. */
++object HapticsController {
++
++    private fun vibrator(context: Context): Vibrator? {
++        val app = context.applicationContext
++        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++            (app.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
++        } else {
++            @Suppress("DEPRECATION")
++            app.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
++        }
++    }
++
++    /** @return true if a vibration was started (toggle on + hardware present). */
++    fun vibratePattern(context: Context, pattern: LongArray): Boolean {
++        DeviceFeedbackPrefs.ensureInitialized(context)
++        if (!DeviceFeedbackPrefs.hapticsEnabled.value) return false
++        return try {
++            val v = vibrator(context) ?: return false
++            if (!v.hasVibrator()) return false
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                v.vibrate(VibrationEffect.createWaveform(pattern, -1))
++            } else {
++                @Suppress("DEPRECATION")
++                v.vibrate(pattern, -1)
++            }
++            true
++        } catch (_: Exception) {
++            false
++        }
++    }
++
++    fun tick(context: Context): Boolean = vibratePattern(context, longArrayOf(0, 30))
++
++    fun cancel(context: Context) {
++        try { vibrator(context)?.cancel() } catch (_: Exception) { }
++    }
++}
+diff --git a/app/src/main/java/com/example/device/SlotAlertGuard.kt b/app/src/main/java/com/example/device/SlotAlertGuard.kt
+new file mode 100644
+index 0000000..dbfb632
+--- /dev/null
++++ b/app/src/main/java/com/example/device/SlotAlertGuard.kt
+@@ -0,0 +1,73 @@
++package com.example.device
++
++import android.content.Context
++
++/** Tiny persistent/in-memory long store so the guard logic is unit-testable without Android. */
++interface KeyValueStore {
++    fun getLong(key: String): Long?
++    fun putLong(key: String, value: Long)
++    fun remove(key: String)
++    fun keys(): Set<String>
++}
++
++class InMemoryKeyValueStore : KeyValueStore {
++    private val map = LinkedHashMap<String, Long>()
++    @Synchronized override fun getLong(key: String): Long? = map[key]
++    @Synchronized override fun putLong(key: String, value: Long) { map[key] = value }
++    @Synchronized override fun remove(key: String) { map.remove(key) }
++    @Synchronized override fun keys(): Set<String> = map.keys.toSet()
++}
++
++/** SharedPreferences-backed store. Use a dedicated prefs file per guard (keys() lists the whole file). */
++class PrefsKeyValueStore(context: Context, name: String) : KeyValueStore {
++    private val prefs = context.applicationContext.getSharedPreferences(name, Context.MODE_PRIVATE)
++    override fun getLong(key: String): Long? = if (prefs.contains(key)) prefs.getLong(key, 0L) else null
++    override fun putLong(key: String, value: Long) { prefs.edit().putLong(key, value).apply() }
++    override fun remove(key: String) { prefs.edit().remove(key).apply() }
++    override fun keys(): Set<String> = prefs.all.keys.toSet()
++}
++
++/**
++ * Duplicate-alert control. Every automatic trigger path (1-second foreground ticker, WorkManager worker,
++ * snooze worker, FCM) asks [tryAcquire] with a deterministic key first. Same key inside [windowMs] => false (skip).
++ */
++class SlotAlertGuard(
++    private val store: KeyValueStore,
++    private val windowMs: Long = DEFAULT_WINDOW_MS,
++    private val maxKeys: Int = 64
++) {
++    @Synchronized
++    fun tryAcquire(key: String, nowMs: Long): Boolean {
++        val last = store.getLong(key)
++        // nowMs < last => device clock moved backwards; allow instead of blocking forever.
++        if (last != null && nowMs >= last && nowMs - last < windowMs) return false
++        store.putLong(key, nowMs)
++        prune(nowMs)
++        return true
++    }
++
++    private fun prune(nowMs: Long) {
++        val all = store.keys()
++        if (all.size <= maxKeys) return
++        val stamped = all.mapNotNull { k -> store.getLong(k)?.let { k to it } }
++        stamped.filter { nowMs - it.second >= windowMs }.forEach { store.remove(it.first) }
++        val remaining = store.keys()
++        if (remaining.size > maxKeys) {
++            stamped.filter { it.first in remaining }
++                .sortedBy { it.second }
++                .take(remaining.size - maxKeys)
++                .forEach { store.remove(it.first) }
++        }
++    }
++
++    companion object {
++        const val DEFAULT_WINDOW_MS = 90_000L
++
++        /** Same key whether built by the ticker (now) or by the worker (scheduled target time). */
++        fun slotKey(year: Int, dayOfYear: Int, slotIndex: Int, hour24: Int, minute: Int): String =
++            "slot_${year}_${dayOfYear}_s${slotIndex}_${hour24}_$minute"
++
++        fun snoozeKey(year: Int, dayOfYear: Int, slotIndex: Int, snoozeNumber: Int): String =
++            "snooze_${year}_${dayOfYear}_s${slotIndex}_n$snoozeNumber"
++    }
++}
+diff --git a/app/src/main/java/com/example/device/SnoozePolicy.kt b/app/src/main/java/com/example/device/SnoozePolicy.kt
+new file mode 100644
+index 0000000..cbd026d
+--- /dev/null
++++ b/app/src/main/java/com/example/device/SnoozePolicy.kt
+@@ -0,0 +1,25 @@
++package com.example.device
++
++object SnoozePolicy {
++    const val DEFAULT_MINUTES = 5
++    const val MAX_SNOOZES_PER_SLOT_PER_DAY = 3
++    const val TEST_DELAY_SECONDS = 10L
++
++    fun canSnooze(alreadySnoozed: Int): Boolean = alreadySnoozed in 0 until MAX_SNOOZES_PER_SLOT_PER_DAY
++
++    fun delayMs(minutes: Int = DEFAULT_MINUTES): Long = minutes.coerceIn(1, 30) * 60_000L
++}
++
++/** Counts snoozes per slot per day so "snooze forever" is impossible. */
++class SnoozeTracker(private val store: KeyValueStore) {
++    private fun key(year: Int, dayOfYear: Int, slotIndex: Int) = "snz_${year}_${dayOfYear}_s$slotIndex"
++
++    fun count(year: Int, dayOfYear: Int, slotIndex: Int): Int =
++        (store.getLong(key(year, dayOfYear, slotIndex)) ?: 0L).toInt()
++
++    fun increment(year: Int, dayOfYear: Int, slotIndex: Int): Int {
++        val next = count(year, dayOfYear, slotIndex) + 1
++        store.putLong(key(year, dayOfYear, slotIndex), next.toLong())
++        return next
++    }
++}
+diff --git a/app/src/main/java/com/example/device/SnoozeScheduler.kt b/app/src/main/java/com/example/device/SnoozeScheduler.kt
+new file mode 100644
+index 0000000..4b3d9c7
+--- /dev/null
++++ b/app/src/main/java/com/example/device/SnoozeScheduler.kt
+@@ -0,0 +1,86 @@
++package com.example.device
++
++import android.content.Context
++import androidx.core.app.NotificationManagerCompat
++import androidx.work.ExistingWorkPolicy
++import androidx.work.OneTimeWorkRequestBuilder
++import androidx.work.WorkManager
++import androidx.work.workDataOf
++import com.example.ui.components.StudySlotAlarmManager
++import com.example.work.StudySlotAlarmWorker
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.util.Calendar
++import java.util.concurrent.TimeUnit
++
++object SnoozeScheduler {
++    sealed interface Outcome {
++        data class Scheduled(val snoozeNumber: Int, val delayMs: Long) : Outcome
++        object LimitReached : Outcome
++    }
++
++    private const val SNOOZE_PREFS = "upgrade_hub_snooze"
++    private val testScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
++
++    /** Stops the ringing drill and re-rings the same slot after [minutes] (via WorkManager, survives app kill). */
++    fun snooze(
++        context: Context,
++        slotIndex: Int,
++        slotTitle: String,
++        scheduledTimeLabel: String,
++        minutes: Int = SnoozePolicy.DEFAULT_MINUTES,
++        isTest: Boolean = false
++    ): Outcome {
++        val app = context.applicationContext
++        val cal = Calendar.getInstance()
++        val year = cal.get(Calendar.YEAR)
++        val doy = cal.get(Calendar.DAY_OF_YEAR)
++        val tracker = SnoozeTracker(PrefsKeyValueStore(app, SNOOZE_PREFS))
++
++        if (!isTest && !SnoozePolicy.canSnooze(tracker.count(year, doy, slotIndex))) {
++            return Outcome.LimitReached
++        }
++
++        StudySlotAlarmManager.stopMockDrillAudio(app)
++        try { NotificationManagerCompat.from(app).cancel(2040 + slotIndex) } catch (_: Exception) { }
++
++        val number = if (isTest) 0 else tracker.increment(year, doy, slotIndex)
++        val delayMs = if (isTest) TimeUnit.SECONDS.toMillis(SnoozePolicy.TEST_DELAY_SECONDS) else SnoozePolicy.delayMs(minutes)
++
++        val data = workDataOf(
++            StudySlotAlarmWorker.KEY_SLOT_INDEX to slotIndex,
++            StudySlotAlarmWorker.KEY_SLOT_TITLE to slotTitle,
++            StudySlotAlarmWorker.KEY_SLOT_TIME to (if (isTest) "Snooze test (+${SnoozePolicy.TEST_DELAY_SECONDS}s)" else "Snoozed from $scheduledTimeLabel"),
++            StudySlotAlarmWorker.KEY_IS_TEST to isTest,
++            StudySlotAlarmWorker.KEY_IS_SNOOZE to true,
++            // test snoozes carry no key so they always ring; real snoozes are deduplicated
++            StudySlotAlarmWorker.KEY_DEDUPE_KEY to (if (isTest) "" else SlotAlertGuard.snoozeKey(year, doy, slotIndex, number))
++        )
++        val request = OneTimeWorkRequestBuilder<StudySlotAlarmWorker>()
++            .setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
++            .setInputData(data)
++            .addTag("study_slot_snooze")
++            .build()
++
++        // One pending snooze per slot: tapping Snooze twice cannot create two alarms.
++        WorkManager.getInstance(app).enqueueUniqueWork("study_slot_snooze_$slotIndex", ExistingWorkPolicy.REPLACE, request)
++        DeviceAnalytics.log(app, "slot_snoozed", mapOf("n" to number.toString(), "test" to isTest.toString()))
++        return Outcome.Scheduled(number, delayMs)
++    }
++
++    /** Manual end-to-end check: rings the drill now, auto-snoozes after 3s, rings again ~10s later. */
++    fun runSnoozeTest(context: Context) {
++        val app = context.applicationContext
++        StudySlotAlarmManager.ensureInitialized(app)
++        val title = "[SNOOZE TEST] ${StudySlotAlarmManager.getSlotConfig(0).title}"
++        StudySlotAlarmManager.startThirtySecondMockDrillAudio(app, 0, title, "Now")
++        testScope.launch {
++            delay(3_000)
++            withContext(Dispatchers.Main) { snooze(app, 0, title, "Now", isTest = true) }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/example/device/SupabaseDeviceRegistry.kt b/app/src/main/java/com/example/device/SupabaseDeviceRegistry.kt
+new file mode 100644
+index 0000000..b9eb298
+--- /dev/null
++++ b/app/src/main/java/com/example/device/SupabaseDeviceRegistry.kt
+@@ -0,0 +1,113 @@
++package com.example.device
++
++import android.content.Context
++import androidx.work.BackoffPolicy
++import androidx.work.Constraints
++import androidx.work.CoroutineWorker
++import androidx.work.ExistingWorkPolicy
++import androidx.work.NetworkType
++import androidx.work.OneTimeWorkRequestBuilder
++import androidx.work.WorkManager
++import androidx.work.WorkerParameters
++import com.example.BuildConfig
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import org.json.JSONObject
++import java.util.concurrent.TimeUnit
++
++/** Supplies the Supabase access token (JWT) of the signed-in user. Wire this when Supabase Auth lands on Android. */
++fun interface SupabaseSessionProvider {
++    suspend fun accessToken(): String?
++}
++
++/**
++ * Registers the FCM token with our backend (/api/devices/register -> Supabase `device_tokens`, RLS protected).
++ * Supabase stays the source of truth; Firebase only delivers the push.
++ */
++object SupabaseDeviceRegistry {
++    private const val PREFS = "upgrade_hub_device_registry"
++    private const val K_PENDING = "pending_token"
++    private const val WORK_NAME = "upgradehub_device_token_sync"
++    private val JSON = "application/json; charset=utf-8".toMediaType()
++    private val client by lazy {
++        OkHttpClient.Builder()
++            .callTimeout(20, TimeUnit.SECONDS)
++            .build()
++    }
++
++    @Volatile
++    var sessionProvider: SupabaseSessionProvider = SupabaseSessionProvider { null }
++
++    enum class SyncOutcome { DONE, NO_SESSION, FAILED_RETRYABLE, FAILED_PERMANENT }
++
++    fun onNewToken(context: Context, token: String) {
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++            .edit().putString(K_PENDING, token).apply()
++        scheduleSync(context)
++    }
++
++    fun scheduleSync(context: Context) {
++        val app = context.applicationContext
++        val hasPending = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(K_PENDING, null) != null
++        if (!hasPending) return
++        val request = OneTimeWorkRequestBuilder<DeviceTokenSyncWorker>()
++            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
++            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
++            .build()
++        WorkManager.getInstance(app).enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request)
++    }
++
++    suspend fun syncPending(context: Context): SyncOutcome = withContext(Dispatchers.IO) {
++        val app = context.applicationContext
++        val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        val token = prefs.getString(K_PENDING, null) ?: return@withContext SyncOutcome.DONE
++        val jwt = sessionProvider.accessToken() ?: return@withContext SyncOutcome.NO_SESSION
++
++        val base = BuildConfig.UPGRADEHUB_API_BASE_URL.trim().trimEnd('/')
++        if (!base.startsWith("https://")) return@withContext SyncOutcome.FAILED_PERMANENT   // never send tokens over http
++
++        val body = JSONObject()
++            .put("token", token)
++            .put("platform", "android")
++            .put("appVersion", BuildConfig.VERSION_NAME)
++            .toString()
++            .toRequestBody(JSON)
++        val request = Request.Builder()
++            .url("$base/api/devices/register")
++            .addHeader("Authorization", "Bearer $jwt")
++            .post(body)
++            .build()
++
++        try {
++            client.newCall(request).execute().use { resp ->
++                when {
++                    resp.isSuccessful -> {
++                        prefs.edit().remove(K_PENDING).apply()
++                        SyncOutcome.DONE
++                    }
++                    resp.code == 401 -> SyncOutcome.NO_SESSION          // expired JWT: retry after refresh
++                    resp.code == 429 || resp.code >= 500 -> SyncOutcome.FAILED_RETRYABLE
++                    else -> SyncOutcome.FAILED_PERMANENT                 // 400/403: retrying will not help
++                }
++            }
++        } catch (_: Exception) {
++            SyncOutcome.FAILED_RETRYABLE
++        }
++    }
++}
++
++class DeviceTokenSyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
++    override suspend fun doWork(): Result = when (SupabaseDeviceRegistry.syncPending(applicationContext)) {
++        SupabaseDeviceRegistry.SyncOutcome.DONE -> Result.success()
++        SupabaseDeviceRegistry.SyncOutcome.NO_SESSION ->
++            // User not signed in yet: stop retrying; DeviceLayer.initialize() retries on next app start/login.
++            if (runAttemptCount >= 3) Result.success() else Result.retry()
++        SupabaseDeviceRegistry.SyncOutcome.FAILED_RETRYABLE ->
++            if (runAttemptCount >= 8) Result.failure() else Result.retry()
++        SupabaseDeviceRegistry.SyncOutcome.FAILED_PERMANENT -> Result.failure()
++    }
++}
+diff --git a/app/src/main/java/com/example/device/fcm/AnnouncementNotifier.kt b/app/src/main/java/com/example/device/fcm/AnnouncementNotifier.kt
+new file mode 100644
+index 0000000..f5615a2
+--- /dev/null
++++ b/app/src/main/java/com/example/device/fcm/AnnouncementNotifier.kt
+@@ -0,0 +1,67 @@
++package com.example.device.fcm
++
++import android.Manifest
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.os.Build
++import androidx.core.app.NotificationCompat
++import androidx.core.app.NotificationManagerCompat
++import androidx.core.content.ContextCompat
++import com.example.MainActivity
++import com.example.R
++import com.example.device.DeviceLayer
++
++object AnnouncementNotifier {
++    /** Must match `channelId` used by the server (lib/notifications/fcm.ts). */
++    const val CHANNEL_ID = "announcements"
++    private const val BASE_ID = 7000
++
++    fun ensureChannel(context: Context) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
++        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
++        nm.createNotificationChannel(
++            NotificationChannel(CHANNEL_ID, "Announcements", NotificationManager.IMPORTANCE_DEFAULT).apply {
++                description = "Admin announcements and syllabus updates"
++            }
++        )
++    }
++
++    /**
++     * Duplicate control: (1) 24h persistent guard on the server `dedupe_key`,
++     * (2) notification tag = dedupe_key, so even a repeated delivery replaces instead of stacking.
++     * @return true if shown.
++     */
++    fun show(context: Context, dedupeKey: String, title: String, body: String): Boolean {
++        val app = context.applicationContext
++        if (!DeviceLayer.fcmGuard(app).tryAcquire("fcm_$dedupeKey", System.currentTimeMillis())) return false
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
++            ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
++        ) return false
++
++        ensureChannel(app)
++        val intent = Intent(app, MainActivity::class.java).apply {
++            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
++        }
++        val pending = PendingIntent.getActivity(
++            app, BASE_ID, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
++        )
++        val n = NotificationCompat.Builder(app, CHANNEL_ID)
++            .setSmallIcon(R.mipmap.ic_launcher)
++            .setContentTitle(title.take(120))
++            .setContentText(body.take(300))
++            .setStyle(NotificationCompat.BigTextStyle().bigText(body.take(500)))
++            .setAutoCancel(true)
++            .setContentIntent(pending)
++            .build()
++        return try {
++            NotificationManagerCompat.from(app).notify(dedupeKey.take(64), BASE_ID, n)
++            true
++        } catch (_: SecurityException) {
++            false
++        }
++    }
++}
+diff --git a/app/src/main/java/com/example/device/fcm/UpgradeHubMessagingService.kt b/app/src/main/java/com/example/device/fcm/UpgradeHubMessagingService.kt
+new file mode 100644
+index 0000000..57efca5
+--- /dev/null
++++ b/app/src/main/java/com/example/device/fcm/UpgradeHubMessagingService.kt
+@@ -0,0 +1,26 @@
++package com.example.device.fcm
++
++import com.example.device.DeviceAnalytics
++import com.example.device.SupabaseDeviceRegistry
++import com.google.firebase.messaging.FirebaseMessagingService
++import com.google.firebase.messaging.RemoteMessage
++
++/**
++ * FCM is only the delivery pipe. Tokens go to Supabase via [SupabaseDeviceRegistry].
++ * Note: when the app is in the background, Android shows `notification` payloads itself
++ * (tagged with dedupe_key => repeats replace); this callback covers foreground delivery.
++ */
++class UpgradeHubMessagingService : FirebaseMessagingService() {
++
++    override fun onNewToken(token: String) {
++        SupabaseDeviceRegistry.onNewToken(applicationContext, token)
++    }
++
++    override fun onMessageReceived(message: RemoteMessage) {
++        val key = message.data["dedupe_key"] ?: message.messageId ?: return
++        val title = message.notification?.title ?: message.data["title"] ?: return
++        val body = message.notification?.body ?: message.data["body"].orEmpty()
++        val shown = AnnouncementNotifier.show(applicationContext, key, title, body)
++        DeviceAnalytics.log(applicationContext, "push_received", mapOf("shown" to shown.toString()))
++    }
++}
+diff --git a/app/src/main/java/com/example/ui/components/AmbientFocusHapticsCard.kt b/app/src/main/java/com/example/ui/components/AmbientFocusHapticsCard.kt
+new file mode 100644
+index 0000000..5c8f776
+--- /dev/null
++++ b/app/src/main/java/com/example/ui/components/AmbientFocusHapticsCard.kt
+@@ -0,0 +1,134 @@
++package com.example.ui.components
++
++import android.widget.Toast
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.Slider
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.example.device.DeviceFeedbackPrefs
++import com.example.device.HapticsController
++import com.example.device.SnoozePolicy
++import com.example.device.SnoozeScheduler
++
++/** Study-environment toggles (ambient sound, haptics) + device self-tests (haptics, snooze). */
++@Composable
++fun AmbientFocusHapticsCard(modifier: Modifier = Modifier) {
++    val context = LocalContext.current
++    DeviceFeedbackPrefs.ensureInitialized(context)
++    val haptics by DeviceFeedbackPrefs.hapticsEnabled.collectAsState()
++    val ambient by DeviceFeedbackPrefs.ambientEnabled.collectAsState()
++    val volume by DeviceFeedbackPrefs.ambientVolume.collectAsState()
++
++    Surface(
++        shape = RoundedCornerShape(12.dp),
++        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
++        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
++        modifier = modifier.fillMaxWidth().testTag("ambient_focus_haptics_card")
++    ) {
++        Column(
++            modifier = Modifier.padding(12.dp),
++            verticalArrangement = Arrangement.spacedBy(8.dp)
++        ) {
++            Text(
++                text = "STUDY ENVIRONMENT",
++                fontSize = 11.sp,
++                fontWeight = FontWeight.Black,
++                letterSpacing = 0.8.sp,
++                color = Color(0xFF0070F3)
++            )
++
++            ToggleRow(
++                title = "Ambient focus sound",
++                subtitle = "Soft brown noise while you study (pauses during the alarm)",
++                checked = ambient,
++                tag = "ambient_sound_switch"
++            ) { DeviceFeedbackPrefs.setAmbientEnabled(context, it) }
++
++            if (ambient) {
++                Slider(
++                    value = volume.toFloat(),
++                    onValueChange = { DeviceFeedbackPrefs.setAmbientVolume(context, it.toInt()) },
++                    valueRange = 0f..100f,
++                    modifier = Modifier.testTag("ambient_volume_slider")
++                )
++            }
++
++            ToggleRow(
++                title = "Haptics",
++                subtitle = "Vibration for the study-slot alarm and drills",
++                checked = haptics,
++                tag = "haptics_switch"
++            ) {
++                DeviceFeedbackPrefs.setHapticsEnabled(context, it)
++                if (it) HapticsController.tick(context)
++            }
++
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                OutlinedButton(
++                    onClick = {
++                        val ok = HapticsController.vibratePattern(context, longArrayOf(0, 150, 100, 150))
++                        Toast.makeText(
++                            context,
++                            if (ok) "Haptics OK" else "Haptics off or not supported on this device",
++                            Toast.LENGTH_SHORT
++                        ).show()
++                    },
++                    modifier = Modifier.testTag("test_haptics_btn")
++                ) { Text("Test haptics", fontSize = 11.sp) }
++
++                OutlinedButton(
++                    onClick = {
++                        SnoozeScheduler.runSnoozeTest(context)
++                        Toast.makeText(
++                            context,
++                            "Snooze test: alarm rings now, snoozes in 3s, rings again ~${SnoozePolicy.TEST_DELAY_SECONDS}s later",
++                            Toast.LENGTH_LONG
++                        ).show()
++                    },
++                    modifier = Modifier.testTag("test_snooze_btn")
++                ) { Text("Snooze test (${SnoozePolicy.TEST_DELAY_SECONDS}s)", fontSize = 11.sp) }
++            }
++        }
++    }
++}
++
++@Composable
++private fun ToggleRow(
++    title: String,
++    subtitle: String,
++    checked: Boolean,
++    tag: String,
++    onChange: (Boolean) -> Unit
++) {
++    Row(
++        modifier = Modifier.fillMaxWidth(),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.SpaceBetween
++    ) {
++        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
++            Text(text = title, fontSize = 13.sp, fontWeight = FontWeight.Bold)
++            Text(text = subtitle, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
++        }
++        Switch(checked = checked, onCheckedChange = onChange, modifier = Modifier.testTag(tag))
++    }
++}
+diff --git a/app/src/main/java/com/example/ui/components/NotificationCenterDialog.kt b/app/src/main/java/com/example/ui/components/NotificationCenterDialog.kt
+index f318662..07c94fb 100644
+--- a/app/src/main/java/com/example/ui/components/NotificationCenterDialog.kt
++++ b/app/src/main/java/com/example/ui/components/NotificationCenterDialog.kt
+@@ -8,6 +8,13 @@ import android.content.Context
+ import android.content.Intent
+ import android.content.pm.PackageManager
+ import com.example.MainActivity
++import android.widget.Toast
++import com.example.device.AmbientFocusPlayer
++import com.example.device.DeviceFeedbackPrefs
++import com.example.device.DeviceLayer
++import com.example.device.HapticsController
++import com.example.device.SlotAlertGuard
++import com.example.device.SnoozeScheduler
+ import com.example.work.StudySlotWorkScheduler
+ import android.media.AudioAttributes
+ import android.media.AudioFormat
+@@ -210,6 +217,7 @@ fun formatTime12Hour(hour24: Int, minute: Int): String {
+ }
+ 
+ const val STUDY_REMINDER_CHANNEL_ID = "study_slot_alarm_fullscreen_channel"
++const val STUDY_REMINDER_CHANNEL_ID_NO_HAPTICS = "study_slot_alarm_fullscreen_channel_no_haptics"
+ private const val PREFS_NAME = "upgrade_hub_notifications_prefs"
+ 
+ /**
+@@ -286,7 +294,7 @@ object StudySlotAlarmManager {
+                 val m = prefs.getInt("slot_${i}_minute", defaultSlots.getOrNull(i)?.minute ?: 0).coerceIn(0, 59)
+                 val customTitle = prefs.getString("slot_${i}_title", defaultSlots.getOrNull(i)?.title ?: "Study Slot ${i + 1}") ?: "Study Slot ${i + 1}"
+                 val customDesc = prefs.getString("slot_${i}_desc", defaultSlots.getOrNull(i)?.description ?: "Automated 30s Study Drill Alert") ?: "Automated 30s Study Drill Alert"
+-                StudySlotAlarmConfig(slotIndex = i, title = customTitle, description = customDesc, hour24 = h, minute = m, isEnabled = true)
++                StudySlotAlarmConfig(slotIndex = i, title = customTitle, description = customDesc, hour24 = h, minute = m, isEnabled = prefs.getBoolean("slot_alarm_${i + 1}", true))
+             }
+         } else {
+             defaultSlots.map { def ->
+@@ -294,7 +302,7 @@ object StudySlotAlarmManager {
+                 val h = prefs.getInt("slot_${idx}_hour24", def.hour24).coerceIn(0, 23)
+                 val m = prefs.getInt("slot_${idx}_minute", def.minute).coerceIn(0, 59)
+                 val customTitle = prefs.getString("slot_${idx}_title", def.title) ?: def.title
+-                def.copy(hour24 = h, minute = m, title = customTitle, isEnabled = true)
++                def.copy(hour24 = h, minute = m, title = customTitle, isEnabled = prefs.getBoolean("slot_alarm_${idx + 1}", true))
+             }
+         }
+         _slotConfigs.value = loaded
+@@ -317,7 +325,7 @@ object StudySlotAlarmManager {
+ 
+         isInitialized = true
+         try {
+-            StudySlotWorkScheduler.scheduleAllSlots(context.applicationContext)
++            StudySlotWorkScheduler.scheduleAllSlots(context.applicationContext, replace = false)
+         } catch (_: Exception) {
+         }
+     }
+@@ -499,6 +507,15 @@ object StudySlotAlarmManager {
+                 if (item.slotIndex == slotIndex) item.copy(isEnabled = enabled) else item
+             }
+         }
++
++        try {
++            if (enabled) {
++                StudySlotWorkScheduler.scheduleSlot(context.applicationContext, getSlotConfig(slotIndex))
++            } else {
++                StudySlotWorkScheduler.cancelSlot(context.applicationContext, slotIndex)
++            }
++        } catch (_: Exception) {
++        }
+     }
+ 
+     /**
+@@ -524,7 +541,10 @@ object StudySlotAlarmManager {
+             context = context,
+             slotIndex = matchingSlot.slotIndex,
+             slotTitle = matchingSlot.title,
+-            scheduledTimeLabel = matchingSlot.formattedTime
++            scheduledTimeLabel = matchingSlot.formattedTime,
++            dedupeKey = SlotAlertGuard.slotKey(
++                cal.get(Calendar.YEAR), dayOfYear, matchingSlot.slotIndex, hour24, minute
++            )
+         )
+     }
+ 
+@@ -535,10 +555,19 @@ object StudySlotAlarmManager {
+         context: Context,
+         slotIndex: Int,
+         slotTitle: String,
+-        scheduledTimeLabel: String
++        scheduledTimeLabel: String,
++        dedupeKey: String? = null
+     ) {
+         val appContext = context.applicationContext
+         ensureInitialized(appContext)
++
++        // Automatic triggers (ticker / WorkManager / snooze) carry a dedupeKey: ring only if the slot is still
++        // enabled and nobody rang this exact slot-occurrence already. Manual tests pass null and always ring.
++        if (dedupeKey != null) {
++            val slot = _slotConfigs.value.getOrNull(slotIndex)
++            if (slot == null || !slot.isEnabled) return
++            if (!DeviceLayer.slotGuard(appContext).tryAcquire(dedupeKey, System.currentTimeMillis())) return
++        }
+         val policy = _drillPolicy.value
+ 
+         val extraInfo = if (policy.dynamicallyAdjust) {
+@@ -574,6 +603,7 @@ object StudySlotAlarmManager {
+ 
+         val appContext = context.applicationContext
+         ensureInitialized(appContext)
++        AmbientFocusPlayer.suspendForAlarm(appContext)
+ 
+         val policy = _drillPolicy.value
+         val isDynamic = policy.dynamicallyAdjust
+@@ -615,20 +645,11 @@ object StudySlotAlarmManager {
+         } catch (_: Exception) {
+         }
+ 
+-        // Trigger Vibrator pulse if available
+-        try {
+-            val vibrator = appContext.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+-            if (vibrator != null && vibrator.hasVibrator()) {
+-                val pattern = longArrayOf(0, 400, 200, 400, 200, 400, 200, 400, 200, 400)
+-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+-                    vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+-                } else {
+-                    @Suppress("DEPRECATION")
+-                    vibrator.vibrate(pattern, -1)
+-                }
+-            }
+-        } catch (_: Exception) {
+-        }
++        // Haptics (respects the user's Haptics toggle)
++        HapticsController.vibratePattern(
++            appContext,
++            longArrayOf(0, 400, 200, 400, 200, 400, 200, 400, 200, 400)
++        )
+ 
+         // Countdown timer job (30 seconds)
+         drillJob = scope.launch {
+@@ -820,6 +841,8 @@ object StudySlotAlarmManager {
+             } catch (_: Exception) {
+             }
+         }
++
++        AmbientFocusPlayer.resumeAfterAlarm { _activeMockDrill.value != null }
+     }
+ }
+ 
+@@ -871,6 +894,29 @@ fun triggerStudySlotReminderNotification(
+                 setShowBadge(true)
+             }
+             notificationManager.createNotificationChannel(channel)
++
++            // Same alarm channel without vibration, used when the Haptics toggle is off
++            // (a channel's vibration cannot be changed after creation).
++            val quietChannel = NotificationChannel(
++                STUDY_REMINDER_CHANNEL_ID_NO_HAPTICS,
++                "Study Slot Alarms (no vibration)",
++                NotificationManager.IMPORTANCE_HIGH
++            ).apply {
++                description = "Same alarm without vibration (Haptics toggle off)"
++                enableVibration(false)
++                setSound(alarmSoundUri, audioAttributes)
++                setBypassDnd(true)
++                lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
++                setShowBadge(true)
++            }
++            notificationManager.createNotificationChannel(quietChannel)
++        }
++
++        DeviceFeedbackPrefs.ensureInitialized(context)
++        val alarmChannelId = if (DeviceFeedbackPrefs.hapticsEnabled.value) {
++            STUDY_REMINDER_CHANNEL_ID
++        } else {
++            STUDY_REMINDER_CHANNEL_ID_NO_HAPTICS
+         }
+ 
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+@@ -897,7 +943,7 @@ fun triggerStudySlotReminderNotification(
+             PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+         )
+ 
+-        val notification = NotificationCompat.Builder(context, STUDY_REMINDER_CHANNEL_ID)
++        val notification = NotificationCompat.Builder(context, alarmChannelId)
+             .setSmallIcon(R.mipmap.ic_launcher)
+             .setContentTitle(slotTitle)
+             .setContentText(slotBody)
+@@ -1052,6 +1098,49 @@ fun ActiveMockDrillRingingBanner(
+                     .clip(RoundedCornerShape(3.dp))
+             )
+ 
++            val bannerContext = LocalContext.current
++            Spacer(modifier = Modifier.height(8.dp))
++            Row(
++                modifier = Modifier.fillMaxWidth(),
++                horizontalArrangement = Arrangement.End
++            ) {
++                Surface(
++                    shape = RoundedCornerShape(10.dp),
++                    color = Color.White.copy(alpha = 0.92f),
++                    modifier = Modifier
++                        .clickable {
++                            when (
++                                val result = SnoozeScheduler.snooze(
++                                    bannerContext,
++                                    drill.slotIndex,
++                                    drill.slotTitle,
++                                    drill.scheduledTimeLabel
++                                )
++                            ) {
++                                is SnoozeScheduler.Outcome.Scheduled -> Toast.makeText(
++                                    bannerContext,
++                                    "😴 Snoozed for ${result.delayMs / 60_000} min",
++                                    Toast.LENGTH_SHORT
++                                ).show()
++                                SnoozeScheduler.Outcome.LimitReached -> Toast.makeText(
++                                    bannerContext,
++                                    "Snooze limit reached for today. Time to study!",
++                                    Toast.LENGTH_SHORT
++                                ).show()
++                            }
++                        }
++                        .testTag("snooze_study_slot_btn")
++                ) {
++                    Text(
++                        text = "😴 Snooze 5 min",
++                        fontSize = 11.sp,
++                        fontWeight = FontWeight.Black,
++                        color = Color(0xFF7F1D1D),
++                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
++                    )
++                }
++            }
++
+             Spacer(modifier = Modifier.height(6.dp))
+             Row(
+                 modifier = Modifier.fillMaxWidth(),
+diff --git a/app/src/main/java/com/example/ui/components/ScheduledStudySlotsEmergencyDrillSection.kt b/app/src/main/java/com/example/ui/components/ScheduledStudySlotsEmergencyDrillSection.kt
+index 31539c6..db1a773 100644
+--- a/app/src/main/java/com/example/ui/components/ScheduledStudySlotsEmergencyDrillSection.kt
++++ b/app/src/main/java/com/example/ui/components/ScheduledStudySlotsEmergencyDrillSection.kt
+@@ -294,6 +294,9 @@ fun ScheduledStudySlotsEmergencyDrillSection(
+             }
+         }
+ 
++        // Study environment: ambient sound + haptics toggles, haptics/snooze self-tests
++        AmbientFocusHapticsCard()
++
+         // Active Emergency Mock Drill Live Banner (if ringing right now)
+         AnimatedVisibility(
+             visible = activeMockDrill != null,
+diff --git a/app/src/main/java/com/example/widget/NextSlotResolver.kt b/app/src/main/java/com/example/widget/NextSlotResolver.kt
+new file mode 100644
+index 0000000..6f1caaf
+--- /dev/null
++++ b/app/src/main/java/com/example/widget/NextSlotResolver.kt
+@@ -0,0 +1,24 @@
++package com.example.widget
++
++data class SlotLite(val index: Int, val title: String, val hour24: Int, val minute: Int, val enabled: Boolean)
++data class NextSlot(val slot: SlotLite, val minutesUntil: Int)
++
++object NextSlotResolver {
++    /** Next enabled slot from "now", wrapping past midnight. Ties => lower index. Null if none enabled. */
++    fun resolve(slots: List<SlotLite>, nowHour: Int, nowMinute: Int): NextSlot? {
++        val nowMin = nowHour * 60 + nowMinute
++        return slots.filter { it.enabled }
++            .map { s ->
++                val t = s.hour24 * 60 + s.minute
++                NextSlot(s, ((t - nowMin) % 1440 + 1440) % 1440)
++            }
++            .minWithOrNull(compareBy<NextSlot>({ it.minutesUntil }, { it.slot.index }))
++    }
++
++    fun formatCountdown(minutes: Int): String = when {
++        minutes <= 0 -> "now"
++        minutes < 60 -> "${minutes}m"
++        minutes % 60 == 0 -> "${minutes / 60}h"
++        else -> "${minutes / 60}h ${minutes % 60}m"
++    }
++}
+diff --git a/app/src/main/java/com/example/widget/UpgradeHubStreakWidgetProvider.kt b/app/src/main/java/com/example/widget/UpgradeHubStreakWidgetProvider.kt
+index 04d3ca7..f20c186 100644
+--- a/app/src/main/java/com/example/widget/UpgradeHubStreakWidgetProvider.kt
++++ b/app/src/main/java/com/example/widget/UpgradeHubStreakWidgetProvider.kt
+@@ -24,6 +24,20 @@ class UpgradeHubStreakWidgetProvider : AppWidgetProvider() {
+         }
+     }
+ 
++    override fun onEnabled(context: Context) {
++        super.onEnabled(context)
++        WidgetRefreshScheduler.schedulePeriodic(context)
++        try {
++            WidgetRefreshScheduler.refreshNow(context)
++        } catch (_: Exception) {
++        }
++    }
++
++    override fun onDisabled(context: Context) {
++        super.onDisabled(context)
++        WidgetRefreshScheduler.cancelPeriodic(context)
++    }
++
+     companion object {
+         private const val PREFS_NAME = "upgrade_hub_widget_prefs"
+         private const val KEY_STREAK = "streak_days"
+@@ -57,6 +71,19 @@ class UpgradeHubStreakWidgetProvider : AppWidgetProvider() {
+             }
+         }
+ 
++        /** Updates only the "next slot" lines (used by the background refresh worker). */
++        fun updateNextSlot(context: Context, title: String, subtitle: String) {
++            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
++                .putString(KEY_SLOT_TITLE, title)
++                .putString(KEY_SLOT_SUBTITLE, subtitle)
++                .apply()
++            val manager = AppWidgetManager.getInstance(context)
++            val ids = manager.getAppWidgetIds(ComponentName(context, UpgradeHubStreakWidgetProvider::class.java))
++            for (id in ids) {
++                updateAppWidget(context, manager, id)
++            }
++        }
++
+         fun requestPinWidget(context: Context): Boolean {
+             val manager = AppWidgetManager.getInstance(context)
+             val provider = ComponentName(context, UpgradeHubStreakWidgetProvider::class.java)
+diff --git a/app/src/main/java/com/example/widget/WidgetRefreshWorker.kt b/app/src/main/java/com/example/widget/WidgetRefreshWorker.kt
+new file mode 100644
+index 0000000..7a52e5c
+--- /dev/null
++++ b/app/src/main/java/com/example/widget/WidgetRefreshWorker.kt
+@@ -0,0 +1,55 @@
++package com.example.widget
++
++import android.content.Context
++import androidx.work.CoroutineWorker
++import androidx.work.ExistingPeriodicWorkPolicy
++import androidx.work.PeriodicWorkRequestBuilder
++import androidx.work.WorkManager
++import androidx.work.WorkerParameters
++import com.example.ui.components.StudySlotAlarmManager
++import java.util.Calendar
++import java.util.concurrent.TimeUnit
++
++class WidgetRefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
++    override suspend fun doWork(): Result = try {
++        WidgetRefreshScheduler.refreshNow(applicationContext)
++        Result.success()
++    } catch (_: Exception) {
++        Result.retry()
++    }
++}
++
++object WidgetRefreshScheduler {
++    private const val PERIODIC = "upgradehub_widget_refresh"
++
++    /** 30 min is a battery-friendly cadence (WorkManager minimum is 15). KEEP => no duplicate schedules. */
++    fun schedulePeriodic(context: Context) {
++        val request = PeriodicWorkRequestBuilder<WidgetRefreshWorker>(30, TimeUnit.MINUTES).build()
++        WorkManager.getInstance(context.applicationContext)
++            .enqueueUniquePeriodicWork(PERIODIC, ExistingPeriodicWorkPolicy.KEEP, request)
++    }
++
++    fun cancelPeriodic(context: Context) {
++        WorkManager.getInstance(context.applicationContext).cancelUniqueWork(PERIODIC)
++    }
++
++    fun refreshNow(context: Context) {
++        val app = context.applicationContext
++        StudySlotAlarmManager.ensureInitialized(app)
++        val slots = StudySlotAlarmManager.slotConfigs.value.map {
++            SlotLite(it.slotIndex, it.title, it.hour24, it.minute, it.isEnabled)
++        }
++        val cal = Calendar.getInstance()
++        val next = NextSlotResolver.resolve(slots, cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE))
++        if (next != null) {
++            val time = com.example.ui.components.formatTime12Hour(next.slot.hour24, next.slot.minute)
++            UpgradeHubStreakWidgetProvider.updateNextSlot(
++                app,
++                "Next: ${next.slot.title}",
++                "$time • in ${NextSlotResolver.formatCountdown(next.minutesUntil)} • Tap to open"
++            )
++        } else {
++            UpgradeHubStreakWidgetProvider.updateNextSlot(app, "No active study slots", "Add a slot to get reminders")
++        }
++    }
++}
+diff --git a/app/src/main/java/com/example/work/StudySlotAlarmWorker.kt b/app/src/main/java/com/example/work/StudySlotAlarmWorker.kt
+index 18a0f52..bfbbc44 100644
+--- a/app/src/main/java/com/example/work/StudySlotAlarmWorker.kt
++++ b/app/src/main/java/com/example/work/StudySlotAlarmWorker.kt
+@@ -5,7 +5,9 @@ import android.os.PowerManager
+ import android.util.Log
+ import androidx.work.CoroutineWorker
+ import androidx.work.WorkerParameters
++import com.example.device.DeviceAnalytics
+ import com.example.ui.components.StudySlotAlarmManager
++import com.example.widget.WidgetRefreshScheduler
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.withContext
+ 
+@@ -24,6 +26,8 @@ class StudySlotAlarmWorker(
+         const val KEY_SLOT_TITLE = "slot_title"
+         const val KEY_SLOT_TIME = "slot_time"
+         const val KEY_IS_TEST = "is_test"
++        const val KEY_IS_SNOOZE = "is_snooze"
++        const val KEY_DEDUPE_KEY = "dedupe_key"
+     }
+ 
+     override suspend fun doWork(): Result = withContext(Dispatchers.Default) {
+@@ -32,6 +36,8 @@ class StudySlotAlarmWorker(
+         val slotTitle = inputData.getString(KEY_SLOT_TITLE) ?: "Study Slot ${slotIndex + 1}"
+         val scheduledTimeLabel = inputData.getString(KEY_SLOT_TIME) ?: ""
+         val isTest = inputData.getBoolean(KEY_IS_TEST, false)
++        val isSnooze = inputData.getBoolean(KEY_IS_SNOOZE, false)
++        val dedupeKey = inputData.getString(KEY_DEDUPE_KEY)?.takeIf { it.isNotBlank() }
+ 
+         Log.d(TAG, "StudySlotAlarmWorker executing for slot $slotIndex ($slotTitle at $scheduledTimeLabel, isTest=$isTest)")
+ 
+@@ -52,19 +58,26 @@ class StudySlotAlarmWorker(
+                     context = appContext,
+                     slotIndex = slotIndex,
+                     slotTitle = slotTitle,
+-                    scheduledTimeLabel = scheduledTimeLabel
++                    scheduledTimeLabel = scheduledTimeLabel,
++                    dedupeKey = dedupeKey
+                 )
+             }
+ 
+             // If not a one-off test, automatically re-schedule the next day's occurrence for this slot
+-            if (!isTest) {
++            if (!isTest && !isSnooze) {
+                 val currentConfig = StudySlotAlarmManager.getSlotConfig(slotIndex)
+                 StudySlotWorkScheduler.scheduleSlot(appContext, currentConfig)
+             }
+ 
++            try {
++                WidgetRefreshScheduler.refreshNow(appContext)   // widget shows the NEXT slot now
++            } catch (_: Exception) {
++            }
++
+             Result.success()
+         } catch (e: Exception) {
+             Log.e(TAG, "Error executing study slot alarm worker", e)
++            DeviceAnalytics.recordNonFatal(e)
+             Result.failure()
+         } finally {
+             try {
+diff --git a/app/src/main/java/com/example/work/StudySlotWorkScheduler.kt b/app/src/main/java/com/example/work/StudySlotWorkScheduler.kt
+index 01fe457..a9ae88a 100644
+--- a/app/src/main/java/com/example/work/StudySlotWorkScheduler.kt
++++ b/app/src/main/java/com/example/work/StudySlotWorkScheduler.kt
+@@ -8,6 +8,7 @@ import androidx.work.NetworkType
+ import androidx.work.OneTimeWorkRequestBuilder
+ import androidx.work.WorkManager
+ import androidx.work.workDataOf
++import com.example.device.SlotAlertGuard
+ import com.example.ui.components.StudySlotAlarmConfig
+ import com.example.ui.components.StudySlotAlarmManager
+ import java.util.Calendar
+@@ -25,7 +26,7 @@ object StudySlotWorkScheduler {
+      * Schedules a high-priority WorkManager task for the specified study slot.
+      * Computes the exact delay until the upcoming slot time (today or tomorrow).
+      */
+-    fun scheduleSlot(context: Context, slot: StudySlotAlarmConfig) {
++    fun scheduleSlot(context: Context, slot: StudySlotAlarmConfig, replace: Boolean = true) {
+         val appContext = context.applicationContext
+         val workManager = WorkManager.getInstance(appContext)
+ 
+@@ -50,7 +51,15 @@ object StudySlotWorkScheduler {
+             StudySlotAlarmWorker.KEY_SLOT_INDEX to slot.slotIndex,
+             StudySlotAlarmWorker.KEY_SLOT_TITLE to slot.title,
+             StudySlotAlarmWorker.KEY_SLOT_TIME to slot.formattedTime,
+-            StudySlotAlarmWorker.KEY_IS_TEST to false
++            StudySlotAlarmWorker.KEY_IS_TEST to false,
++            // Same key the foreground ticker builds for this occurrence => only one of them rings
++            StudySlotAlarmWorker.KEY_DEDUPE_KEY to SlotAlertGuard.slotKey(
++                target.get(Calendar.YEAR),
++                target.get(Calendar.DAY_OF_YEAR),
++                slot.slotIndex,
++                slot.hour24,
++                slot.minute
++            )
+         )
+ 
+         val workRequest = OneTimeWorkRequestBuilder<StudySlotAlarmWorker>()
+@@ -62,7 +71,7 @@ object StudySlotWorkScheduler {
+ 
+         workManager.enqueueUniqueWork(
+             "$UNIQUE_WORK_PREFIX${slot.slotIndex}",
+-            ExistingWorkPolicy.REPLACE,
++            if (replace) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,
+             workRequest
+         )
+     }
+@@ -70,13 +79,13 @@ object StudySlotWorkScheduler {
+     /**
+      * Schedules WorkManager tasks for all active study slots.
+      */
+-    fun scheduleAllSlots(context: Context) {
++    fun scheduleAllSlots(context: Context, replace: Boolean = true) {
+         val appContext = context.applicationContext
+         StudySlotAlarmManager.ensureInitialized(appContext)
+         val slots = StudySlotAlarmManager.slotConfigs.value
+         Log.d(TAG, "Scheduling all ${slots.size} study slots with WorkManager")
+         for (slot in slots) {
+-            scheduleSlot(appContext, slot)
++            if (slot.isEnabled) scheduleSlot(appContext, slot, replace) else cancelSlot(appContext, slot.slotIndex)
+         }
+     }
+ 
+diff --git a/app/src/test/java/com/example/device/NextSlotResolverTest.kt b/app/src/test/java/com/example/device/NextSlotResolverTest.kt
+new file mode 100644
+index 0000000..523a47d
+--- /dev/null
++++ b/app/src/test/java/com/example/device/NextSlotResolverTest.kt
+@@ -0,0 +1,41 @@
++package com.example.device
++
++import com.example.widget.NextSlotResolver
++import com.example.widget.SlotLite
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++class NextSlotResolverTest {
++    private val slots = listOf(
++        SlotLite(0, "Morning", 6, 0, true),
++        SlotLite(1, "Forenoon", 10, 0, true),
++        SlotLite(2, "Afternoon", 15, 0, false),
++        SlotLite(3, "Night", 20, 0, true)
++    )
++
++    @Test fun picksNextEnabledToday() {
++        val n = NextSlotResolver.resolve(slots, 8, 30)!!
++        assertEquals(1, n.slot.index); assertEquals(90, n.minutesUntil)
++    }
++
++    @Test fun skipsDisabledSlots() {
++        assertEquals(3, NextSlotResolver.resolve(slots, 11, 0)!!.slot.index)
++    }
++
++    @Test fun wrapsPastMidnight() {
++        val n = NextSlotResolver.resolve(slots, 21, 0)!!
++        assertEquals(0, n.slot.index); assertEquals(9 * 60, n.minutesUntil)
++    }
++
++    @Test fun noneEnabledReturnsNull() {
++        assertNull(NextSlotResolver.resolve(slots.map { it.copy(enabled = false) }, 9, 0))
++    }
++
++    @Test fun countdownFormatting() {
++        assertEquals("now", NextSlotResolver.formatCountdown(0))
++        assertEquals("45m", NextSlotResolver.formatCountdown(45))
++        assertEquals("2h", NextSlotResolver.formatCountdown(120))
++        assertEquals("2h 15m", NextSlotResolver.formatCountdown(135))
++    }
++}
+diff --git a/app/src/test/java/com/example/device/SlotAlertGuardTest.kt b/app/src/test/java/com/example/device/SlotAlertGuardTest.kt
+new file mode 100644
+index 0000000..b8ed002
+--- /dev/null
++++ b/app/src/test/java/com/example/device/SlotAlertGuardTest.kt
+@@ -0,0 +1,62 @@
++package com.example.device
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class SlotAlertGuardTest {
++    private fun guard(window: Long = 90_000L, max: Int = 64) = SlotAlertGuard(InMemoryKeyValueStore(), window, max)
++
++    @Test fun tickerAndWorkerWithSameKeyRingOnce() {
++        val g = guard()
++        val key = SlotAlertGuard.slotKey(2026, 297, 0, 6, 0)
++        assertTrue(g.tryAcquire(key, 1_000))        // foreground ticker fires first
++        assertFalse(g.tryAcquire(key, 4_000))       // WorkManager worker arrives seconds later => suppressed
++    }
++
++    @Test fun workerRunningMinutesLateStillMatchesTickerKey() {
++        // key is built from the SCHEDULED time, not from "now"
++        assertEquals(SlotAlertGuard.slotKey(2026, 297, 1, 10, 0), SlotAlertGuard.slotKey(2026, 297, 1, 10, 0))
++    }
++
++    @Test fun differentSlotsDaysAndTimesAreIndependent() {
++        val g = guard()
++        assertTrue(g.tryAcquire(SlotAlertGuard.slotKey(2026, 297, 0, 6, 0), 0))
++        assertTrue(g.tryAcquire(SlotAlertGuard.slotKey(2026, 297, 1, 6, 0), 0))   // other slot, same minute
++        assertTrue(g.tryAcquire(SlotAlertGuard.slotKey(2026, 298, 0, 6, 0), 0))   // next day
++        assertTrue(g.tryAcquire(SlotAlertGuard.slotKey(2026, 297, 0, 7, 0), 0))   // time edited
++    }
++
++    @Test fun snoozeKeysNeverCollideWithSlotKeysOrEachOther() {
++        val slot = SlotAlertGuard.slotKey(2026, 297, 0, 6, 0)
++        val s1 = SlotAlertGuard.snoozeKey(2026, 297, 0, 1)
++        val s2 = SlotAlertGuard.snoozeKey(2026, 297, 0, 2)
++        assertNotEquals(slot, s1); assertNotEquals(s1, s2)
++        val g = guard()
++        assertTrue(g.tryAcquire(slot, 0)); assertTrue(g.tryAcquire(s1, 1)); assertTrue(g.tryAcquire(s2, 2))
++        assertFalse(g.tryAcquire(s1, 3))            // same snooze delivered twice => once
++    }
++
++    @Test fun allowedAgainAfterWindowExpires() {
++        val g = guard(window = 90_000L)
++        assertTrue(g.tryAcquire("k", 0))
++        assertFalse(g.tryAcquire("k", 89_999))
++        assertTrue(g.tryAcquire("k", 90_000))
++    }
++
++    @Test fun clockMovingBackwardsDoesNotBlockForever() {
++        val g = guard()
++        assertTrue(g.tryAcquire("k", 1_000_000))
++        assertTrue(g.tryAcquire("k", 500))
++    }
++
++    @Test fun storeStaysBounded() {
++        val store = InMemoryKeyValueStore()
++        val g = SlotAlertGuard(store, windowMs = 1_000_000, maxKeys = 10)
++        for (i in 0 until 100) g.tryAcquire("k$i", i.toLong())
++        assertTrue(store.keys().size <= 10)
++        assertFalse(g.tryAcquire("k99", 200))       // newest kept
++    }
++}
+diff --git a/app/src/test/java/com/example/device/SnoozePolicyTest.kt b/app/src/test/java/com/example/device/SnoozePolicyTest.kt
+new file mode 100644
+index 0000000..6fc0018
+--- /dev/null
++++ b/app/src/test/java/com/example/device/SnoozePolicyTest.kt
+@@ -0,0 +1,30 @@
++package com.example.device
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class SnoozePolicyTest {
++    @Test fun limitsSnoozesPerDay() {
++        assertTrue(SnoozePolicy.canSnooze(0))
++        assertTrue(SnoozePolicy.canSnooze(2))
++        assertFalse(SnoozePolicy.canSnooze(3))
++        assertFalse(SnoozePolicy.canSnooze(-1))
++    }
++
++    @Test fun delayIsClamped() {
++        assertEquals(5 * 60_000L, SnoozePolicy.delayMs())
++        assertEquals(60_000L, SnoozePolicy.delayMs(0))
++        assertEquals(30 * 60_000L, SnoozePolicy.delayMs(999))
++    }
++
++    @Test fun trackerCountsPerSlotAndDay() {
++        val t = SnoozeTracker(InMemoryKeyValueStore())
++        assertEquals(0, t.count(2026, 297, 0))
++        assertEquals(1, t.increment(2026, 297, 0))
++        assertEquals(2, t.increment(2026, 297, 0))
++        assertEquals(0, t.count(2026, 297, 1))      // other slot
++        assertEquals(0, t.count(2026, 298, 0))      // next day resets
++    }
++}
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 03f7e50..5842626 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -96,6 +96,9 @@ firebase-appcheck-recaptcha = { group = "com.google.firebase", name = "firebase-
+ firebase-appcheck-debug = { group = "com.google.firebase", name = "firebase-appcheck-debug" }
+ firebase-firestore = { group = "com.google.firebase", name = "firebase-firestore" }
+ firebase-auth = { group = "com.google.firebase", name = "firebase-auth" }
++firebase-messaging = { group = "com.google.firebase", name = "firebase-messaging" }
++firebase-analytics = { group = "com.google.firebase", name = "firebase-analytics" }
++firebase-crashlytics = { group = "com.google.firebase", name = "firebase-crashlytics" }
+ androidx-credentials = { group = "androidx.credentials", name = "credentials", version.ref = "credentials" }
+ androidx-credentials-play-services = { group = "androidx.credentials", name = "credentials-play-services-auth", version.ref = "credentials" }
+ googleid = { group = "com.google.android.libraries.identity.googleid", name = "googleid", version.ref = "googleid" }
+-- 
+2.43.0
+

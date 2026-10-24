@@ -1,0 +1,1358 @@
+From 1ea46d01fc527840f4a1f8653a735b2d344718c1 Mon Sep 17 00:00:00 2001
+From: UpgradeHub <dev@upgradehub.local>
+Date: Sat, 24 Oct 2026 08:59:06 +0000
+Subject: [PATCH 1/2] feat(day-9): admin authorization, announcements/syllabus
+ routes, device tokens, notification dedupe
+
+---
+ .env.example                                  |   5 +
+ .github/workflows/ci.yml                      |   2 +
+ app/admin/page.tsx                            |  12 ++
+ app/api/admin/announcements/route.ts          |  97 +++++++++
+ app/api/admin/syllabus/route.ts               |  85 ++++++++
+ app/api/devices/register/route.ts             |  45 ++++
+ .../internal/notifications/dispatch/route.ts  |  27 +++
+ components/admin/AdminPanel.tsx               | 122 +++++++++++
+ lib/admin/validators.ts                       | 139 ++++++++++++
+ lib/auth/server.ts                            |  65 ++++++
+ lib/http.ts                                   |  21 ++
+ lib/notifications/dedupe.ts                   |  44 ++++
+ lib/notifications/fcm.ts                      | 101 +++++++++
+ package.json                                  |  11 +-
+ scripts/regression-check.mjs                  |  80 +++++++
+ .../migrations/002_admin_device_layer.sql     | 200 ++++++++++++++++++
+ tests/dedupe.test.ts                          |  37 ++++
+ tests/validators.test.ts                      |  63 ++++++
+ 18 files changed, 1153 insertions(+), 3 deletions(-)
+ create mode 100644 app/admin/page.tsx
+ create mode 100644 app/api/admin/announcements/route.ts
+ create mode 100644 app/api/admin/syllabus/route.ts
+ create mode 100644 app/api/devices/register/route.ts
+ create mode 100644 app/api/internal/notifications/dispatch/route.ts
+ create mode 100644 components/admin/AdminPanel.tsx
+ create mode 100644 lib/admin/validators.ts
+ create mode 100644 lib/auth/server.ts
+ create mode 100644 lib/http.ts
+ create mode 100644 lib/notifications/dedupe.ts
+ create mode 100644 lib/notifications/fcm.ts
+ create mode 100644 scripts/regression-check.mjs
+ create mode 100644 supabase/migrations/002_admin_device_layer.sql
+ create mode 100644 tests/dedupe.test.ts
+ create mode 100644 tests/validators.test.ts
+
+diff --git a/.env.example b/.env.example
+index 58d0c76..ede1f87 100644
+--- a/.env.example
++++ b/.env.example
+@@ -2,3 +2,8 @@ NEXT_PUBLIC_SUPABASE_URL=
+ NEXT_PUBLIC_SUPABASE_ANON_KEY=
+ GEMINI_API_KEY=
+ GEMINI_MODEL=gemini-flash-latest
++
++# Day 9 (server only)
++SUPABASE_SERVICE_ROLE_KEY=
++FIREBASE_SERVICE_ACCOUNT_JSON=
++CRON_SECRET=
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 69fe0c2..c754984 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -15,6 +15,8 @@ jobs:
+           cache: npm
+       - run: npm install
+       - run: npm run typecheck
++      - run: npm run test
++      - run: npm run regression
+       - run: npm run lint
+       - run: npm run build
+         env:
+diff --git a/app/admin/page.tsx b/app/admin/page.tsx
+new file mode 100644
+index 0000000..8b0cf3b
+--- /dev/null
++++ b/app/admin/page.tsx
+@@ -0,0 +1,12 @@
++import { AuthGate } from '@/components/AuthGate';
++import { AdminPanel } from '@/components/admin/AdminPanel';
++
++export default function AdminPage() {
++  return (
++    <main className="min-h-screen px-4 py-8">
++      <AuthGate>
++        <AdminPanel />
++      </AuthGate>
++    </main>
++  );
++}
+diff --git a/app/api/admin/announcements/route.ts b/app/api/admin/announcements/route.ts
+new file mode 100644
+index 0000000..3f2b8a1
+--- /dev/null
++++ b/app/api/admin/announcements/route.ts
+@@ -0,0 +1,97 @@
++import { NextRequest, NextResponse } from 'next/server';
++import { isErrorResponse, requireAdmin, writeAudit } from '@/lib/auth/server';
++import { jsonError, readJson } from '@/lib/http';
++import { isUuid, parseAnnouncementInput, parseAnnouncementPatch } from '@/lib/admin/validators';
++import { dispatchQueuedNotifications } from '@/lib/notifications/fcm';
++
++export const runtime = 'nodejs';
++export const dynamic = 'force-dynamic';
++export const maxDuration = 60;
++
++export async function GET(req: NextRequest) {
++  const ctx = await requireAdmin(req);
++  if (isErrorResponse(ctx)) return ctx;
++  const { data, error } = await ctx.db.from('announcements').select('*').order('created_at', { ascending: false }).limit(50);
++  if (error) {
++    console.error('[admin/announcements] list:', error.message);
++    return jsonError('Could not load announcements.', 'SERVER_ERROR', 500);
++  }
++  return NextResponse.json({ items: data });
++}
++
++export async function POST(req: NextRequest) {
++  const ctx = await requireAdmin(req);
++  if (isErrorResponse(ctx)) return ctx;
++
++  const body = await readJson(req);
++  if (!body.ok) return body.response;
++  const parsed = parseAnnouncementInput(body.value);
++  if (!parsed.ok) return jsonError(parsed.error, 'BAD_REQUEST', 400);
++
++  const { data, error } = await ctx.db
++    .from('announcements')
++    .insert({ ...parsed.value, status: 'draft', created_by: ctx.userId })
++    .select()
++    .single();
++  if (error || !data) {
++    console.error('[admin/announcements] insert:', error?.message);
++    return jsonError('Could not create announcement.', 'SERVER_ERROR', 500);
++  }
++  await writeAudit(ctx, 'announcement.create', 'announcement', data.id, { title: data.title });
++  return NextResponse.json({ item: data }, { status: 201 });
++}
++
++export async function PATCH(req: NextRequest) {
++  const ctx = await requireAdmin(req);
++  if (isErrorResponse(ctx)) return ctx;
++
++  const body = await readJson(req);
++  if (!body.ok) return body.response;
++  const parsed = parseAnnouncementPatch(body.value);
++  if (!parsed.ok) return jsonError(parsed.error, 'BAD_REQUEST', 400);
++  const { id, publish, archive, ...fields } = parsed.value;
++
++  const update: Record<string, unknown> = { ...fields };
++  if (publish) { update.status = 'published'; update.published_at = new Date().toISOString(); }
++  if (archive) update.status = 'archived';
++  if (Object.keys(update).length === 0) return jsonError('Nothing to update.', 'BAD_REQUEST', 400);
++
++  const { data, error } = await ctx.db.from('announcements').update(update).eq('id', id).select().maybeSingle();
++  if (error) {
++    console.error('[admin/announcements] update:', error.message);
++    return jsonError('Could not update announcement.', 'SERVER_ERROR', 500);
++  }
++  if (!data) return jsonError('Announcement not found.', 'NOT_FOUND', 404);
++  await writeAudit(ctx, publish ? 'announcement.publish' : archive ? 'announcement.archive' : 'announcement.update', 'announcement', id);
++
++  let queued = 0;
++  let dispatch: unknown = null;
++  if (publish) {
++    // Idempotent: dobara publish karne par 0 naye rows (unique(user_id, dedupe_key)).
++    const { data: count, error: qErr } = await ctx.db.rpc('enqueue_announcement_notifications', { p_announcement_id: id });
++    if (qErr) console.error('[admin/announcements] enqueue:', qErr.message);
++    else queued = typeof count === 'number' ? count : 0;
++    try {
++      dispatch = await dispatchQueuedNotifications();
++    } catch (e) {
++      console.error('[admin/announcements] dispatch:', e instanceof Error ? e.message : e);
++      dispatch = { error: 'dispatch_failed' };   // rows 'queued' rehti hain; cron retry karega
++    }
++  }
++  return NextResponse.json({ item: data, queued, dispatch });
++}
++
++export async function DELETE(req: NextRequest) {
++  const ctx = await requireAdmin(req);
++  if (isErrorResponse(ctx)) return ctx;
++  const id = new URL(req.url).searchParams.get('id');
++  if (!isUuid(id)) return jsonError('valid id is required', 'BAD_REQUEST', 400);
++
++  const { error } = await ctx.db.from('announcements').delete().eq('id', id);
++  if (error) {
++    console.error('[admin/announcements] delete:', error.message);
++    return jsonError('Could not delete announcement.', 'SERVER_ERROR', 500);
++  }
++  await writeAudit(ctx, 'announcement.delete', 'announcement', id);
++  return NextResponse.json({ ok: true });
++}
+diff --git a/app/api/admin/syllabus/route.ts b/app/api/admin/syllabus/route.ts
+new file mode 100644
+index 0000000..49e4b7e
+--- /dev/null
++++ b/app/api/admin/syllabus/route.ts
+@@ -0,0 +1,85 @@
++import { NextRequest, NextResponse } from 'next/server';
++import { isErrorResponse, requireAdmin, requireUser, writeAudit } from '@/lib/auth/server';
++import { jsonError, readJson } from '@/lib/http';
++import { isUuid, parseSyllabusInput, parseSyllabusPatch } from '@/lib/admin/validators';
++
++export const runtime = 'nodejs';
++export const dynamic = 'force-dynamic';
++
++// Students bhi active syllabus padh sakte hain (RLS sirf is_active dikhata hai); admin sab dekhta hai.
++export async function GET(req: NextRequest) {
++  const ctx = await requireUser(req);
++  if (isErrorResponse(ctx)) return ctx;
++  const { data, error } = await ctx.db
++    .from('syllabus_items')
++    .select('*')
++    .order('subject')
++    .order('sort_order')
++    .limit(1000);
++  if (error) {
++    console.error('[admin/syllabus] list:', error.message);
++    return jsonError('Could not load syllabus.', 'SERVER_ERROR', 500);
++  }
++  return NextResponse.json({ items: data });
++}
++
++export async function POST(req: NextRequest) {
++  const ctx = await requireAdmin(req);
++  if (isErrorResponse(ctx)) return ctx;
++  const body = await readJson(req);
++  if (!body.ok) return body.response;
++  const parsed = parseSyllabusInput(body.value);
++  if (!parsed.ok) return jsonError(parsed.error, 'BAD_REQUEST', 400);
++
++  const v = parsed.value;
++  const { data, error } = await ctx.db
++    .from('syllabus_items')
++    .upsert(
++      { subject: v.subject, chapter: v.chapter, topic: v.topic, sort_order: v.sortOrder, is_active: v.isActive, created_by: ctx.userId },
++      { onConflict: 'subject,chapter,topic' }
++    )
++    .select()
++    .single();
++  if (error || !data) {
++    console.error('[admin/syllabus] upsert:', error?.message);
++    return jsonError('Could not save syllabus item.', 'SERVER_ERROR', 500);
++  }
++  await writeAudit(ctx, 'syllabus.upsert', 'syllabus_item', data.id, { subject: v.subject, chapter: v.chapter });
++  return NextResponse.json({ item: data }, { status: 201 });
++}
++
++export async function PATCH(req: NextRequest) {
++  const ctx = await requireAdmin(req);
++  if (isErrorResponse(ctx)) return ctx;
++  const body = await readJson(req);
++  if (!body.ok) return body.response;
++  const parsed = parseSyllabusPatch(body.value);
++  if (!parsed.ok) return jsonError(parsed.error, 'BAD_REQUEST', 400);
++
++  const update: Record<string, unknown> = {};
++  if (parsed.value.isActive !== undefined) update.is_active = parsed.value.isActive;
++  if (parsed.value.sortOrder !== undefined) update.sort_order = parsed.value.sortOrder;
++
++  const { data, error } = await ctx.db.from('syllabus_items').update(update).eq('id', parsed.value.id).select().maybeSingle();
++  if (error) {
++    console.error('[admin/syllabus] update:', error.message);
++    return jsonError('Could not update syllabus item.', 'SERVER_ERROR', 500);
++  }
++  if (!data) return jsonError('Syllabus item not found.', 'NOT_FOUND', 404);
++  await writeAudit(ctx, 'syllabus.update', 'syllabus_item', parsed.value.id);
++  return NextResponse.json({ item: data });
++}
++
++export async function DELETE(req: NextRequest) {
++  const ctx = await requireAdmin(req);
++  if (isErrorResponse(ctx)) return ctx;
++  const id = new URL(req.url).searchParams.get('id');
++  if (!isUuid(id)) return jsonError('valid id is required', 'BAD_REQUEST', 400);
++  const { error } = await ctx.db.from('syllabus_items').delete().eq('id', id);
++  if (error) {
++    console.error('[admin/syllabus] delete:', error.message);
++    return jsonError('Could not delete syllabus item.', 'SERVER_ERROR', 500);
++  }
++  await writeAudit(ctx, 'syllabus.delete', 'syllabus_item', id);
++  return NextResponse.json({ ok: true });
++}
+diff --git a/app/api/devices/register/route.ts b/app/api/devices/register/route.ts
+new file mode 100644
+index 0000000..299433c
+--- /dev/null
++++ b/app/api/devices/register/route.ts
+@@ -0,0 +1,45 @@
++import { NextRequest, NextResponse } from 'next/server';
++import { isErrorResponse, requireUser } from '@/lib/auth/server';
++import { jsonError, readJson } from '@/lib/http';
++import { parseDeviceInput } from '@/lib/admin/validators';
++
++export const runtime = 'nodejs';
++export const dynamic = 'force-dynamic';
++
++// Android/iOS/web app login ke baad FCM token yahan register karta hai.
++export async function POST(req: NextRequest) {
++  const ctx = await requireUser(req);
++  if (isErrorResponse(ctx)) return ctx;
++  const body = await readJson(req, 8_000);
++  if (!body.ok) return body.response;
++  const parsed = parseDeviceInput(body.value);
++  if (!parsed.ok) return jsonError(parsed.error, 'BAD_REQUEST', 400);
++
++  const { error } = await ctx.db.rpc('register_device_token', {
++    p_token: parsed.value.token,
++    p_platform: parsed.value.platform,
++    p_app_version: parsed.value.appVersion ?? null,
++  });
++  if (error) {
++    console.error('[devices/register]', error.message);
++    return jsonError('Could not register device.', 'SERVER_ERROR', 500);
++  }
++  return NextResponse.json({ ok: true });
++}
++
++// Logout par token hata do (RLS: sirf apna token delete ho sakta hai).
++export async function DELETE(req: NextRequest) {
++  const ctx = await requireUser(req);
++  if (isErrorResponse(ctx)) return ctx;
++  const body = await readJson(req, 8_000);
++  if (!body.ok) return body.response;
++  const parsed = parseDeviceInput(body.value);
++  if (!parsed.ok) return jsonError(parsed.error, 'BAD_REQUEST', 400);
++
++  const { error } = await ctx.db.from('device_tokens').delete().eq('fcm_token', parsed.value.token);
++  if (error) {
++    console.error('[devices/unregister]', error.message);
++    return jsonError('Could not unregister device.', 'SERVER_ERROR', 500);
++  }
++  return NextResponse.json({ ok: true });
++}
+diff --git a/app/api/internal/notifications/dispatch/route.ts b/app/api/internal/notifications/dispatch/route.ts
+new file mode 100644
+index 0000000..6a5354f
+--- /dev/null
++++ b/app/api/internal/notifications/dispatch/route.ts
+@@ -0,0 +1,27 @@
++import { timingSafeEqual } from 'node:crypto';
++import { NextRequest, NextResponse } from 'next/server';
++import { jsonError } from '@/lib/http';
++import { dispatchQueuedNotifications } from '@/lib/notifications/fcm';
++
++export const runtime = 'nodejs';
++export const dynamic = 'force-dynamic';
++export const maxDuration = 60;
++
++function safeEqual(a: string, b: string): boolean {
++  const ab = Buffer.from(a);
++  const bb = Buffer.from(b);
++  return ab.length === bb.length && timingSafeEqual(ab, bb);
++}
++
++// Retry/cron endpoint: Authorization: Bearer <CRON_SECRET>. User login se nahi chalta.
++export async function GET(req: NextRequest) {
++  const secret = process.env.CRON_SECRET;
++  const given = /^Bearer\s+(.+)$/i.exec(req.headers.get('authorization') ?? '')?.[1] ?? '';
++  if (!secret || secret.length < 16 || !safeEqual(given, secret)) return jsonError('Unauthorized', 'UNAUTHORIZED', 401);
++  try {
++    return NextResponse.json(await dispatchQueuedNotifications());
++  } catch (e) {
++    console.error('[internal/dispatch]', e instanceof Error ? e.message : e);
++    return jsonError('Dispatch failed.', 'SERVER_ERROR', 500);
++  }
++}
+diff --git a/components/admin/AdminPanel.tsx b/components/admin/AdminPanel.tsx
+new file mode 100644
+index 0000000..dc29e8f
+--- /dev/null
++++ b/components/admin/AdminPanel.tsx
+@@ -0,0 +1,122 @@
++'use client';
++
++import { useCallback, useEffect, useState } from 'react';
++import type { FormEvent } from 'react';
++import { supabase } from '@/lib/supabase/client';
++
++interface Announcement { id: string; title: string; body: string; audience: string; status: string }
++
++async function adminFetch(path: string, init: RequestInit = {}) {
++  const { data } = await supabase.auth.getSession();
++  const token = data.session?.access_token;
++  const res = await fetch(path, {
++    ...init,
++    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token ?? ''}`, ...(init.headers ?? {}) },
++  });
++  const json = await res.json().catch(() => ({}));
++  if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
++  return json;
++}
++
++export function AdminPanel() {
++  const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
++  const [items, setItems] = useState<Announcement[]>([]);
++  const [msg, setMsg] = useState<string | null>(null);
++  const [title, setTitle] = useState('');
++  const [body, setBody] = useState('');
++  const [subject, setSubject] = useState('');
++  const [chapter, setChapter] = useState('');
++  const [topic, setTopic] = useState('');
++
++  const load = useCallback(async () => {
++    try {
++      const j = await adminFetch('/api/admin/announcements');
++      setItems(j.items ?? []);
++    } catch (e) {
++      setMsg(e instanceof Error ? e.message : 'Load failed');
++    }
++  }, []);
++
++  useEffect(() => {
++    // UI hint hai; asli enforcement server (requireAdmin) + RLS karta hai
++    supabase.rpc('is_admin').then(({ data }) => {
++      setIsAdmin(data === true);
++      if (data === true) void load();
++    });
++  }, [load]);
++
++  const run = async (fn: () => Promise<unknown>, ok: string) => {
++    setMsg(null);
++    try {
++      await fn();
++      setMsg(ok);
++      await load();
++    } catch (e) {
++      setMsg(e instanceof Error ? e.message : 'Failed');
++    }
++  };
++
++  const createAnnouncement = (e: FormEvent) => {
++    e.preventDefault();
++    void run(async () => {
++      await adminFetch('/api/admin/announcements', { method: 'POST', body: JSON.stringify({ title, body }) });
++      setTitle('');
++      setBody('');
++    }, 'Draft created');
++  };
++
++  const addSyllabus = (e: FormEvent) => {
++    e.preventDefault();
++    void run(async () => {
++      await adminFetch('/api/admin/syllabus', { method: 'POST', body: JSON.stringify({ subject, chapter, topic }) });
++      setTopic('');
++    }, 'Syllabus item saved');
++  };
++
++  const field = 'w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm';
++
++  if (isAdmin === null) return <p className="text-center text-slate-400 mt-10 text-sm">Checking access…</p>;
++  if (!isAdmin) return <p className="text-center text-red-300 mt-10 text-sm">Access denied: admin role required.</p>;
++
++  return (
++    <div className="max-w-3xl mx-auto space-y-8">
++      <h1 className="text-xl font-bold">🛡️ Admin Panel</h1>
++      {msg && <p className="text-xs text-amber-300">{msg}</p>}
++
++      <form onSubmit={createAnnouncement} className="space-y-2 rounded-xl border border-slate-800 p-4">
++        <h2 className="font-semibold text-sm">New announcement</h2>
++        <input className={field} placeholder="Title" value={title} onChange={(e) => setTitle(e.target.value)} required minLength={3} maxLength={120} />
++        <textarea className={field} placeholder="Message" value={body} onChange={(e) => setBody(e.target.value)} required maxLength={2000} rows={3} />
++        <button className="px-4 py-2 bg-blue-600 rounded-lg text-sm font-semibold">Save draft</button>
++      </form>
++
++      <section className="space-y-2">
++        <h2 className="font-semibold text-sm">Announcements</h2>
++        {items.map((a) => (
++          <div key={a.id} className="rounded-lg border border-slate-800 p-3 text-sm flex items-start justify-between gap-3">
++            <div>
++              <p className="font-medium">{a.title} <span className="text-xs text-slate-400">· {a.status}</span></p>
++              <p className="text-xs text-slate-400 line-clamp-2">{a.body}</p>
++            </div>
++            {a.status === 'draft' && (
++              <button
++                className="px-3 py-1.5 bg-emerald-600 rounded-lg text-xs font-semibold"
++                onClick={() => void run(() => adminFetch('/api/admin/announcements', { method: 'PATCH', body: JSON.stringify({ id: a.id, publish: true }) }), 'Published & notifications queued')}
++              >
++                Publish
++              </button>
++            )}
++          </div>
++        ))}
++      </section>
++
++      <form onSubmit={addSyllabus} className="space-y-2 rounded-xl border border-slate-800 p-4">
++        <h2 className="font-semibold text-sm">Syllabus item</h2>
++        <input className={field} placeholder="Subject (e.g. Physics)" value={subject} onChange={(e) => setSubject(e.target.value)} required />
++        <input className={field} placeholder="Chapter" value={chapter} onChange={(e) => setChapter(e.target.value)} required />
++        <input className={field} placeholder="Topic" value={topic} onChange={(e) => setTopic(e.target.value)} required />
++        <button className="px-4 py-2 bg-blue-600 rounded-lg text-sm font-semibold">Save</button>
++      </form>
++    </div>
++  );
++}
+diff --git a/lib/admin/validators.ts b/lib/admin/validators.ts
+new file mode 100644
+index 0000000..b62a5da
+--- /dev/null
++++ b/lib/admin/validators.ts
+@@ -0,0 +1,139 @@
++export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
++
++export const AUDIENCES = ['all', 'batch', 'no_batch'] as const;
++export type Audience = (typeof AUDIENCES)[number];
++export const PLATFORMS = ['android', 'ios', 'web'] as const;
++export type Platform = (typeof PLATFORMS)[number];
++
++const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++// eslint-disable-next-line no-control-regex
++const CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
++
++export const isUuid = (v: unknown): v is string => typeof v === 'string' && UUID_RE.test(v);
++
++function obj(raw: unknown): Record<string, unknown> {
++  return typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
++}
++
++function text(v: unknown, min: number, max: number, field: string, multiline = false): Result<string> {
++  if (typeof v !== 'string') return { ok: false, error: `${field} is required` };
++  let s = v.replace(CONTROL_RE, '');
++  if (!multiline) s = s.replace(/[\r\n\t]+/g, ' ');
++  s = s.trim();
++  if (s.length < min) return { ok: false, error: `${field} must be at least ${min} characters` };
++  if (s.length > max) return { ok: false, error: `${field} must be at most ${max} characters` };
++  return { ok: true, value: s };
++}
++
++function audience(v: unknown): Result<Audience> {
++  if (v === undefined) return { ok: true, value: 'all' };
++  return typeof v === 'string' && (AUDIENCES as readonly string[]).includes(v)
++    ? { ok: true, value: v as Audience }
++    : { ok: false, error: 'audience must be all, batch or no_batch' };
++}
++
++export interface AnnouncementInput { title: string; body: string; audience: Audience }
++
++export function parseAnnouncementInput(raw: unknown): Result<AnnouncementInput> {
++  const r = obj(raw);
++  const title = text(r.title, 3, 120, 'title');
++  if (!title.ok) return title;
++  const body = text(r.body, 1, 2000, 'body', true);
++  if (!body.ok) return body;
++  const aud = audience(r.audience);
++  if (!aud.ok) return aud;
++  return { ok: true, value: { title: title.value, body: body.value, audience: aud.value } };
++}
++
++export interface AnnouncementPatch {
++  id: string;
++  title?: string;
++  body?: string;
++  audience?: Audience;
++  publish?: boolean;
++  archive?: boolean;
++}
++
++export function parseAnnouncementPatch(raw: unknown): Result<AnnouncementPatch> {
++  const r = obj(raw);
++  if (!isUuid(r.id)) return { ok: false, error: 'valid id is required' };
++  const out: AnnouncementPatch = { id: r.id };
++  if (r.title !== undefined) {
++    const t = text(r.title, 3, 120, 'title');
++    if (!t.ok) return t;
++    out.title = t.value;
++  }
++  if (r.body !== undefined) {
++    const b = text(r.body, 1, 2000, 'body', true);
++    if (!b.ok) return b;
++    out.body = b.value;
++  }
++  if (r.audience !== undefined) {
++    const a = audience(r.audience);
++    if (!a.ok) return a;
++    out.audience = a.value;
++  }
++  if (r.publish === true) out.publish = true;
++  if (r.archive === true) out.archive = true;
++  if (out.publish && out.archive) return { ok: false, error: 'publish and archive cannot be combined' };
++  return { ok: true, value: out };
++}
++
++export interface SyllabusInput { subject: string; chapter: string; topic: string; sortOrder: number; isActive: boolean }
++
++export function parseSyllabusInput(raw: unknown): Result<SyllabusInput> {
++  const r = obj(raw);
++  const subject = text(r.subject, 2, 50, 'subject');
++  if (!subject.ok) return subject;
++  const chapter = text(r.chapter, 2, 100, 'chapter');
++  if (!chapter.ok) return chapter;
++  const topic = text(r.topic, 1, 120, 'topic');
++  if (!topic.ok) return topic;
++  const sortOrder = r.sortOrder === undefined ? 0 : r.sortOrder;
++  if (typeof sortOrder !== 'number' || !Number.isInteger(sortOrder) || sortOrder < 0 || sortOrder > 10000) {
++    return { ok: false, error: 'sortOrder must be an integer 0-10000' };
++  }
++  if (r.isActive !== undefined && typeof r.isActive !== 'boolean') return { ok: false, error: 'isActive must be boolean' };
++  return {
++    ok: true,
++    value: { subject: subject.value, chapter: chapter.value, topic: topic.value, sortOrder, isActive: r.isActive !== false },
++  };
++}
++
++export interface SyllabusPatch { id: string; isActive?: boolean; sortOrder?: number }
++
++export function parseSyllabusPatch(raw: unknown): Result<SyllabusPatch> {
++  const r = obj(raw);
++  if (!isUuid(r.id)) return { ok: false, error: 'valid id is required' };
++  const out: SyllabusPatch = { id: r.id };
++  if (r.isActive !== undefined) {
++    if (typeof r.isActive !== 'boolean') return { ok: false, error: 'isActive must be boolean' };
++    out.isActive = r.isActive;
++  }
++  if (r.sortOrder !== undefined) {
++    if (typeof r.sortOrder !== 'number' || !Number.isInteger(r.sortOrder) || r.sortOrder < 0 || r.sortOrder > 10000) {
++      return { ok: false, error: 'sortOrder must be an integer 0-10000' };
++    }
++    out.sortOrder = r.sortOrder;
++  }
++  if (out.isActive === undefined && out.sortOrder === undefined) return { ok: false, error: 'nothing to update' };
++  return { ok: true, value: out };
++}
++
++export interface DeviceInput { token: string; platform: Platform; appVersion?: string }
++
++export function parseDeviceInput(raw: unknown): Result<DeviceInput> {
++  const r = obj(raw);
++  if (typeof r.token !== 'string' || r.token.length < 20 || r.token.length > 4096 || /\s/.test(r.token)) {
++    return { ok: false, error: 'invalid token' };
++  }
++  if (typeof r.platform !== 'string' || !(PLATFORMS as readonly string[]).includes(r.platform)) {
++    return { ok: false, error: 'invalid platform' };
++  }
++  let appVersion: string | undefined;
++  if (r.appVersion !== undefined) {
++    if (typeof r.appVersion !== 'string' || r.appVersion.length > 32) return { ok: false, error: 'invalid appVersion' };
++    appVersion = r.appVersion;
++  }
++  return { ok: true, value: { token: r.token, platform: r.platform as Platform, appVersion } };
++}
+diff --git a/lib/auth/server.ts b/lib/auth/server.ts
+new file mode 100644
+index 0000000..2b524e3
+--- /dev/null
++++ b/lib/auth/server.ts
+@@ -0,0 +1,65 @@
++import { createClient, SupabaseClient } from '@supabase/supabase-js';
++import { NextResponse } from 'next/server';
++import { jsonError } from '@/lib/http';
++
++export interface AuthContext {
++  userId: string;
++  /** User ke apne JWT se bana client: har query par RLS lagu hoti hai (service_role nahi). */
++  db: SupabaseClient;
++}
++
++export function isErrorResponse(x: unknown): x is NextResponse {
++  return x instanceof NextResponse;
++}
++
++export async function requireUser(req: Request): Promise<AuthContext | NextResponse> {
++  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
++  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
++  if (!url || !anonKey) {
++    console.error('[auth] Supabase env missing');
++    return jsonError('Server is not configured.', 'SERVER_ERROR', 500);
++  }
++
++  const match = /^Bearer\s+(.+)$/i.exec(req.headers.get('authorization') ?? '');
++  if (!match) return jsonError('Please sign in.', 'UNAUTHORIZED', 401);
++  const token = match[1].trim();
++
++  const db = createClient(url, anonKey, {
++    global: { headers: { Authorization: `Bearer ${token}` } },
++    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
++  });
++
++  const { data, error } = await db.auth.getUser(token);
++  if (error || !data.user) return jsonError('Please sign in.', 'UNAUTHORIZED', 401);
++  return { userId: data.user.id, db };
++}
++
++/**
++ * Admin-only gate. Role DB (user_roles) se aata hai, client ke claim se nahi.
++ * Doosri layer: har table par RLS bhi is_admin() maangti hai.
++ */
++export async function requireAdmin(req: Request): Promise<AuthContext | NextResponse> {
++  const ctx = await requireUser(req);
++  if (isErrorResponse(ctx)) return ctx;
++
++  const { data, error } = await ctx.db.rpc('is_admin');
++  if (error) {
++    console.error('[auth] is_admin failed:', error.message);
++    return jsonError('Could not verify permissions.', 'SERVER_ERROR', 500);
++  }
++  if (data !== true) return jsonError('Admin access required.', 'FORBIDDEN', 403);
++  return ctx;
++}
++
++export async function writeAudit(
++  ctx: AuthContext,
++  action: string,
++  entity: string,
++  entityId: string | null,
++  meta: Record<string, unknown> = {}
++) {
++  const { error } = await ctx.db
++    .from('admin_audit_log')
++    .insert({ actor_id: ctx.userId, action, entity, entity_id: entityId, meta });
++  if (error) console.error('[audit] insert failed:', error.message);
++}
+diff --git a/lib/http.ts b/lib/http.ts
+new file mode 100644
+index 0000000..09d399c
+--- /dev/null
++++ b/lib/http.ts
+@@ -0,0 +1,21 @@
++import { NextResponse } from 'next/server';
++
++export function jsonError(error: string, code: string, status: number, headers?: Record<string, string>) {
++  return NextResponse.json({ error, code }, { status, headers });
++}
++
++/** Body size-limited JSON reader. Lautata hai {ok:true,value} ya {ok:false,response}. */
++export async function readJson(
++  req: Request,
++  maxBytes = 20_000
++): Promise<{ ok: true; value: unknown } | { ok: false; response: NextResponse }> {
++  const declared = Number(req.headers.get('content-length') ?? 0);
++  if (declared > maxBytes) return { ok: false, response: jsonError('Request too large.', 'TOO_LARGE', 413) };
++  const text = await req.text();
++  if (text.length > maxBytes) return { ok: false, response: jsonError('Request too large.', 'TOO_LARGE', 413) };
++  try {
++    return { ok: true, value: JSON.parse(text) };
++  } catch {
++    return { ok: false, response: jsonError('Invalid JSON body.', 'BAD_REQUEST', 400) };
++  }
++}
+diff --git a/lib/notifications/dedupe.ts b/lib/notifications/dedupe.ts
+new file mode 100644
+index 0000000..226e826
+--- /dev/null
++++ b/lib/notifications/dedupe.ts
+@@ -0,0 +1,44 @@
++export type NotificationKind = 'announcement' | 'syllabus' | 'slot_reminder';
++
++const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
++
++/** Stable key: same event => same key => DB unique(user_id, dedupe_key) duplicate rok deta hai. */
++export function buildDedupeKey(kind: NotificationKind, id: string, scope?: string): string {
++  if (!ID_RE.test(id)) throw new Error('invalid id for dedupe key');
++  if (scope !== undefined && !ID_RE.test(scope)) throw new Error('invalid scope for dedupe key');
++  return scope ? `${kind}:${id}:${scope}` : `${kind}:${id}`;
++}
++
++/** Ek batch ke andar (user, key) duplicates hatata hai; pehla rakhta hai. */
++export function uniqueByUserAndKey<T extends { user_id: string; dedupe_key: string }>(rows: T[]): T[] {
++  const seen = new Set<string>();
++  const out: T[] = [];
++  for (const row of rows) {
++    const k = `${row.user_id}|${row.dedupe_key}`;
++    if (seen.has(k)) continue;
++    seen.add(k);
++    out.push(row);
++  }
++  return out;
++}
++
++/** Time-window guard (same logic Android SlotAlertGuard mein hai). true => duplicate, skip karo. */
++export class RecentKeyGuard {
++  private seen = new Map<string, number>();
++  constructor(private ttlMs: number, private maxKeys = 200) {}
++
++  isDuplicate(key: string, now: number): boolean {
++    const last = this.seen.get(key);
++    if (last !== undefined && now - last < this.ttlMs) return true;
++    this.seen.set(key, now);
++    if (this.seen.size > this.maxKeys) {
++      for (const [k, t] of this.seen) if (now - t >= this.ttlMs) this.seen.delete(k);
++      while (this.seen.size > this.maxKeys) {
++        const oldest = this.seen.keys().next().value;
++        if (oldest === undefined) break;
++        this.seen.delete(oldest);
++      }
++    }
++    return false;
++  }
++}
+diff --git a/lib/notifications/fcm.ts b/lib/notifications/fcm.ts
+new file mode 100644
+index 0000000..772eea9
+--- /dev/null
++++ b/lib/notifications/fcm.ts
+@@ -0,0 +1,101 @@
++// SERVER ONLY. Isse kabhi client component se import mat karna.
++import { createClient } from '@supabase/supabase-js';
++import { cert, getApps, initializeApp } from 'firebase-admin/app';
++import { getMessaging, Message } from 'firebase-admin/messaging';
++import { uniqueByUserAndKey } from './dedupe';
++
++interface QueuedRow { id: string; user_id: string; dedupe_key: string; kind: string; title: string; body: string }
++
++export interface DispatchResult {
++  skipped?: string;
++  claimed: number;
++  sent: number;
++  failed: number;
++  prunedTokens: number;
++}
++
++const STALE_TOKEN_CODES = new Set([
++  'messaging/registration-token-not-registered',
++  'messaging/invalid-registration-token',
++]);
++
++export async function dispatchQueuedNotifications(limit = 200): Promise<DispatchResult> {
++  const empty: DispatchResult = { claimed: 0, sent: 0, failed: 0, prunedTokens: 0 };
++  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
++  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
++  const saJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
++  if (!url || !serviceKey || !saJson) return { ...empty, skipped: 'SUPABASE_SERVICE_ROLE_KEY / FIREBASE_SERVICE_ACCOUNT_JSON not set' };
++
++  const admin = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
++
++  const { data: queued, error: qErr } = await admin
++    .from('notification_log')
++    .select('id')
++    .eq('status', 'queued')
++    .order('created_at')
++    .limit(limit);
++  if (qErr) throw new Error(`queue read failed: ${qErr.message}`);
++  if (!queued || queued.length === 0) return empty;
++
++  // Compare-and-set claim: do dispatchers ek hi row ko nahi utha sakte.
++  const { data: claimedRaw, error: cErr } = await admin
++    .from('notification_log')
++    .update({ status: 'sending' })
++    .in('id', queued.map((r) => r.id))
++    .eq('status', 'queued')
++    .select('id,user_id,dedupe_key,kind,title,body');
++  if (cErr) throw new Error(`claim failed: ${cErr.message}`);
++  const claimed = uniqueByUserAndKey((claimedRaw ?? []) as QueuedRow[]);
++  if (claimed.length === 0) return empty;
++
++  const userIds = [...new Set(claimed.map((r) => r.user_id))];
++  const { data: tokenRows, error: tErr } = await admin.from('device_tokens').select('user_id,fcm_token').in('user_id', userIds);
++  if (tErr) throw new Error(`token read failed: ${tErr.message}`);
++
++  const tokensByUser = new Map<string, string[]>();
++  for (const t of tokenRows ?? []) {
++    const list = tokensByUser.get(t.user_id) ?? [];
++    list.push(t.fcm_token);
++    tokensByUser.set(t.user_id, list);
++  }
++
++  if (getApps().length === 0) initializeApp({ credential: cert(JSON.parse(saJson)) });
++  const messaging = getMessaging();
++
++  const messages: Message[] = [];
++  const owners: string[] = [];   // messages[i] kis notification_log row ka hai
++  const tokenOf: string[] = [];
++  for (const row of claimed) {
++    for (const token of tokensByUser.get(row.user_id) ?? []) {
++      messages.push({
++        token,
++        notification: { title: row.title, body: row.body },
++        data: { dedupe_key: row.dedupe_key, kind: row.kind },
++        android: {
++          collapseKey: row.dedupe_key.slice(0, 64),
++          notification: { tag: row.dedupe_key, channelId: 'announcements' },
++        },
++      });
++      owners.push(row.id);
++      tokenOf.push(token);
++    }
++  }
++
++  const okRows = new Set<string>();
++  const staleTokens = new Set<string>();
++  for (let i = 0; i < messages.length; i += 500) {
++    const res = await messaging.sendEach(messages.slice(i, i + 500));
++    res.responses.forEach((r, j) => {
++      if (r.success) okRows.add(owners[i + j]);
++      else if (r.error && STALE_TOKEN_CODES.has(r.error.code)) staleTokens.add(tokenOf[i + j]);
++    });
++  }
++
++  const sentIds = claimed.filter((r) => okRows.has(r.id)).map((r) => r.id);
++  const failedIds = claimed.filter((r) => !okRows.has(r.id)).map((r) => r.id);
++  if (sentIds.length) await admin.from('notification_log').update({ status: 'sent', sent_at: new Date().toISOString() }).in('id', sentIds);
++  if (failedIds.length) await admin.from('notification_log').update({ status: 'failed' }).in('id', failedIds);
++  if (staleTokens.size) await admin.from('device_tokens').delete().in('fcm_token', [...staleTokens]);
++
++  return { claimed: claimed.length, sent: sentIds.length, failed: failedIds.length, prunedTokens: staleTokens.size };
++}
+diff --git a/package.json b/package.json
+index 2787369..1b4d8e4 100644
+--- a/package.json
++++ b/package.json
+@@ -7,13 +7,17 @@
+     "build": "next build",
+     "start": "next start",
+     "lint": "next lint",
+-    "typecheck": "tsc --noEmit"
++    "typecheck": "tsc --noEmit",
++    "test": "node --import tsx --test tests/*.test.ts",
++    "regression": "node scripts/regression-check.mjs",
++    "verify": "npm run typecheck && npm run test && npm run regression"
+   },
+   "dependencies": {
+     "@supabase/supabase-js": "^2.45.0",
+     "next": "^15.0.0",
+     "react": "^19.0.0",
+-    "react-dom": "^19.0.0"
++    "react-dom": "^19.0.0",
++    "firebase-admin": "^13.0.0"
+   },
+   "devDependencies": {
+     "@types/node": "^22.0.0",
+@@ -24,6 +28,7 @@
+     "eslint-config-next": "^15.0.0",
+     "postcss": "^8.4.47",
+     "tailwindcss": "^3.4.14",
+-    "typescript": "^5.6.0"
++    "typescript": "^5.6.0",
++    "tsx": "^4.19.0"
+   }
+ }
+diff --git a/scripts/regression-check.mjs b/scripts/regression-check.mjs
+new file mode 100644
+index 0000000..6404c25
+--- /dev/null
++++ b/scripts/regression-check.mjs
+@@ -0,0 +1,80 @@
++// Static regression gate: node scripts/regression-check.mjs
++import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
++import { join, relative } from 'node:path';
++
++const root = process.cwd();
++const failures = [];
++const passes = [];
++const check = (name, ok, detail = '') => (ok ? passes : failures).push(detail ? `${name}: ${detail}` : name);
++const read = (p) => readFileSync(join(root, p), 'utf8');
++const walk = (dir) => {
++  if (!existsSync(join(root, dir))) return [];
++  return readdirSync(join(root, dir)).flatMap((n) => {
++    if (n === 'node_modules' || n === '.next') return [];
++    const rel = join(dir, n);
++    return statSync(join(root, rel)).isDirectory() ? walk(rel) : [rel];
++  });
++};
++
++// 1) Day 1-8 modules still present
++for (const f of [
++  'types/campus-rewards.ts', 'types/study-coach.ts', 'hooks/useAICoach.ts',
++  'components/AICoachDashboard.tsx', 'components/CampusAndRewardsHub.tsx', 'components/AuthGate.tsx',
++  'lib/supabase/client.ts', 'lib/supabase/verify-user.ts', 'app/api/ai/coach/route.ts',
++  'supabase/migrations/001_init.sql',
++]) check(`module present: ${f}`, existsSync(join(root, f)));
++
++// 2) AI coach route keeps its protections
++const coach = read('app/api/ai/coach/route.ts');
++check('coach: exports POST', /export async function POST/.test(coach));
++check('coach: requires verified user', /getVerifiedUserId\(req\)/.test(coach));
++check('coach: key sent in header not URL', /x-goog-api-key/.test(coach) && !/\?key=/.test(coach));
++check('coach: rate limit present', /isRateLimited/.test(coach));
++
++// 3) Every migration table has RLS enabled; no open policies
++const sql = walk('supabase/migrations').filter((f) => f.endsWith('.sql')).map((f) => [f, read(f)]);
++const allSql = sql.map(([, s]) => s).join('\n');
++for (const m of allSql.matchAll(/create table if not exists public\.(\w+)/gi)) {
++  const t = m[1];
++  check(`RLS enabled on public.${t}`, new RegExp(`alter table public\\.${t} enable row level security`, 'i').test(allSql));
++}
++check('no wide-open policies (using true / with check true)', !/(using|with check)\s*\(\s*true\s*\)/i.test(allSql));
++check('anon revoked on admin tables', ['announcements', 'syllabus_items', 'device_tokens', 'notification_log', 'user_roles', 'admin_audit_log']
++  .every((t) => new RegExp(`revoke all on public\\.${t} from anon`, 'i').test(allSql)));
++check('user_roles not writable by clients', /revoke all on public\.user_roles from anon, authenticated/i.test(allSql) && /grant select on public\.user_roles/i.test(allSql));
++check('notification dedupe unique constraint', /unique \(user_id, dedupe_key\)/i.test(allSql));
++check('SECURITY DEFINER functions pin search_path', [...allSql.matchAll(/security definer/gi)].length === [...allSql.matchAll(/security definer\s+set search_path = ''/gi)].length
++  || [...allSql.matchAll(/language \w+\s+(?:stable\s+)?security definer\s+set search_path = ''/gi)].length >= 3);
++
++// 4) Secrets never reach client bundles
++const clientFiles = [...walk('components'), ...walk('hooks'), 'lib/supabase/client.ts'].filter((f) => /\.(ts|tsx)$/.test(f));
++for (const f of clientFiles) {
++  const s = read(f);
++  check(`no server secret in client file ${f}`, !/SERVICE_ROLE|FIREBASE_SERVICE_ACCOUNT|GEMINI_API_KEY|CRON_SECRET/.test(s));
++}
++const all = [...walk('app'), ...walk('lib'), ...walk('components'), ...walk('hooks')].filter((f) => /\.(ts|tsx)$/.test(f));
++check('no NEXT_PUBLIC_ secret variables', !all.some((f) => /NEXT_PUBLIC_[A-Z_]*(SERVICE_ROLE|GEMINI|FIREBASE_SERVICE|CRON)/.test(read(f))));
++check('service_role used only in lib/notifications/fcm.ts', all.filter((f) => /SUPABASE_SERVICE_ROLE_KEY/.test(read(f))).every((f) => f.replace(/\\/g, '/') === 'lib/notifications/fcm.ts'));
++check('fcm.ts is only imported by server routes', all.filter((f) => /notifications\/fcm/.test(read(f)) && !f.replace(/\\/g, '/').startsWith('app/api/') && !f.endsWith('fcm.ts')).length === 0);
++
++// 5) Admin endpoints are gated
++for (const f of walk('app/api/admin').filter((f) => f.endsWith('route.ts'))) {
++  const s = read(f);
++  const handlers = [...s.matchAll(/export async function (GET|POST|PATCH|DELETE|PUT)/g)].map((m) => m[1]);
++  const gates = [...s.matchAll(/await (requireAdmin|requireUser)\(req\)/g)].length;
++  check(`${f}: every handler authenticates`, handlers.length > 0 && gates >= handlers.length, `${handlers.length} handlers / ${gates} gates`);
++  const mutating = s.split(/export async function /).slice(1).filter((b) => /^(POST|PATCH|DELETE|PUT)/.test(b));
++  check(`${f}: every mutating handler uses requireAdmin`, mutating.every((b) => /requireAdmin\(req\)/.test(b)));
++}
++check('internal dispatch protected by CRON_SECRET', /CRON_SECRET/.test(read('app/api/internal/notifications/dispatch/route.ts')) && /timingSafeEqual/.test(read('app/api/internal/notifications/dispatch/route.ts')));
++check('device register requires user', /requireUser\(req\)/.test(read('app/api/devices/register/route.ts')));
++
++// 6) Repo hygiene
++const gi = read('.gitignore');
++check('.gitignore covers .env*.local', /\.env\*\.local/.test(gi));
++check('next.config keeps security headers', /X-Frame-Options/.test(read('next.config.mjs')));
++
++console.log(`\nPASS ${passes.length}   FAIL ${failures.length}\n`);
++for (const f of failures) console.log('  ✗', f);
++if (failures.length) { console.log('\nRegression check FAILED'); process.exit(1); }
++console.log('Regression check passed');
+diff --git a/supabase/migrations/002_admin_device_layer.sql b/supabase/migrations/002_admin_device_layer.sql
+new file mode 100644
+index 0000000..92d4911
+--- /dev/null
++++ b/supabase/migrations/002_admin_device_layer.sql
+@@ -0,0 +1,200 @@
++-- Day 9: Admin authorization + announcements/syllabus + device tokens + notification dedupe
++-- Run: Supabase Dashboard -> SQL Editor -> paste -> Run   (001_init.sql pehle chal chuka hona chahiye)
++
++-- ============ Shared helper ============
++create or replace function public.set_updated_at()
++returns trigger language plpgsql set search_path = '' as $$
++begin new.updated_at = now(); return new; end; $$;
++
++-- ============ 1) Roles (trusted: client kabhi write nahi kar sakta) ============
++create table if not exists public.user_roles (
++  user_id    uuid primary key references auth.users(id) on delete cascade,
++  role       text not null default 'student' check (role in ('student','moderator','admin')),
++  granted_at timestamptz not null default now()
++);
++alter table public.user_roles enable row level security;
++drop policy if exists "user_roles_select_own" on public.user_roles;
++create policy "user_roles_select_own" on public.user_roles
++  for select to authenticated using ((select auth.uid()) = user_id);
++revoke all on public.user_roles from anon, authenticated;
++grant select on public.user_roles to authenticated;   -- insert/update/delete: sirf SQL Editor / service_role
++
++create or replace function public.is_admin()
++returns boolean language sql stable security definer set search_path = '' as $$
++  select exists (
++    select 1 from public.user_roles
++    where user_id = (select auth.uid()) and role = 'admin'
++  );
++$$;
++revoke execute on function public.is_admin() from public, anon;
++grant  execute on function public.is_admin() to authenticated;
++
++-- ============ 2) Announcements ============
++create table if not exists public.announcements (
++  id           uuid primary key default gen_random_uuid(),
++  title        text not null check (char_length(title) between 3 and 120),
++  body         text not null check (char_length(body)  between 1 and 2000),
++  audience     text not null default 'all' check (audience in ('all','batch','no_batch')),
++  status       text not null default 'draft' check (status in ('draft','published','archived')),
++  published_at timestamptz,
++  created_by   uuid references auth.users(id) on delete set null,
++  created_at   timestamptz not null default now(),
++  updated_at   timestamptz not null default now()
++);
++alter table public.announcements enable row level security;
++drop trigger if exists announcements_updated_at on public.announcements;
++create trigger announcements_updated_at before update on public.announcements
++  for each row execute function public.set_updated_at();
++
++drop policy if exists "announcements_read" on public.announcements;
++drop policy if exists "announcements_admin_insert" on public.announcements;
++drop policy if exists "announcements_admin_update" on public.announcements;
++drop policy if exists "announcements_admin_delete" on public.announcements;
++create policy "announcements_read" on public.announcements
++  for select to authenticated using (status = 'published' or (select public.is_admin()));
++create policy "announcements_admin_insert" on public.announcements
++  for insert to authenticated with check ((select public.is_admin()));
++create policy "announcements_admin_update" on public.announcements
++  for update to authenticated using ((select public.is_admin())) with check ((select public.is_admin()));
++create policy "announcements_admin_delete" on public.announcements
++  for delete to authenticated using ((select public.is_admin()));
++revoke all on public.announcements from anon;
++
++-- ============ 3) Syllabus ============
++create table if not exists public.syllabus_items (
++  id          uuid primary key default gen_random_uuid(),
++  subject     text not null check (char_length(subject) between 2 and 50),
++  chapter     text not null check (char_length(chapter) between 2 and 100),
++  topic       text not null check (char_length(topic)   between 1 and 120),
++  sort_order  integer not null default 0 check (sort_order between 0 and 10000),
++  is_active   boolean not null default true,
++  created_by  uuid references auth.users(id) on delete set null,
++  created_at  timestamptz not null default now(),
++  updated_at  timestamptz not null default now(),
++  unique (subject, chapter, topic)
++);
++alter table public.syllabus_items enable row level security;
++drop trigger if exists syllabus_items_updated_at on public.syllabus_items;
++create trigger syllabus_items_updated_at before update on public.syllabus_items
++  for each row execute function public.set_updated_at();
++
++drop policy if exists "syllabus_read" on public.syllabus_items;
++drop policy if exists "syllabus_admin_insert" on public.syllabus_items;
++drop policy if exists "syllabus_admin_update" on public.syllabus_items;
++drop policy if exists "syllabus_admin_delete" on public.syllabus_items;
++create policy "syllabus_read" on public.syllabus_items
++  for select to authenticated using (is_active or (select public.is_admin()));
++create policy "syllabus_admin_insert" on public.syllabus_items
++  for insert to authenticated with check ((select public.is_admin()));
++create policy "syllabus_admin_update" on public.syllabus_items
++  for update to authenticated using ((select public.is_admin())) with check ((select public.is_admin()));
++create policy "syllabus_admin_delete" on public.syllabus_items
++  for delete to authenticated using ((select public.is_admin()));
++revoke all on public.syllabus_items from anon;
++
++-- ============ 4) Device tokens (FCM) ============
++create table if not exists public.device_tokens (
++  id           uuid primary key default gen_random_uuid(),
++  user_id      uuid not null references auth.users(id) on delete cascade,
++  fcm_token    text not null unique check (char_length(fcm_token) between 20 and 4096),
++  platform     text not null check (platform in ('android','ios','web')),
++  app_version  text check (app_version is null or char_length(app_version) <= 32),
++  last_seen_at timestamptz not null default now(),
++  created_at   timestamptz not null default now()
++);
++create index if not exists device_tokens_user_idx on public.device_tokens(user_id);
++alter table public.device_tokens enable row level security;
++drop policy if exists "device_tokens_select_own" on public.device_tokens;
++drop policy if exists "device_tokens_delete_own" on public.device_tokens;
++create policy "device_tokens_select_own" on public.device_tokens
++  for select to authenticated using ((select auth.uid()) = user_id);
++create policy "device_tokens_delete_own" on public.device_tokens
++  for delete to authenticated using ((select auth.uid()) = user_id);
++revoke all on public.device_tokens from anon, authenticated;
++grant select, delete on public.device_tokens to authenticated;  -- insert/update sirf RPC se
++
++create or replace function public.register_device_token(p_token text, p_platform text, p_app_version text default null)
++returns void language plpgsql security definer set search_path = '' as $$
++declare v_uid uuid := (select auth.uid());
++begin
++  if v_uid is null then raise exception 'not authenticated' using errcode = '28000'; end if;
++  if p_token is null or char_length(p_token) < 20 or char_length(p_token) > 4096 then
++    raise exception 'invalid token' using errcode = '22023';
++  end if;
++  if p_platform not in ('android','ios','web') then
++    raise exception 'invalid platform' using errcode = '22023';
++  end if;
++  -- Shared phone: token naye logged-in user ko transfer ho jaata hai (purane user ko push nahi jayega)
++  insert into public.device_tokens (user_id, fcm_token, platform, app_version, last_seen_at)
++  values (v_uid, p_token, p_platform, left(p_app_version, 32), now())
++  on conflict (fcm_token) do update
++    set user_id = excluded.user_id, platform = excluded.platform,
++        app_version = excluded.app_version, last_seen_at = now();
++end; $$;
++revoke execute on function public.register_device_token(text, text, text) from public, anon;
++grant  execute on function public.register_device_token(text, text, text) to authenticated;
++
++-- ============ 5) Notification log = duplicate control ============
++create table if not exists public.notification_log (
++  id         uuid primary key default gen_random_uuid(),
++  user_id    uuid not null references auth.users(id) on delete cascade,
++  dedupe_key text not null check (char_length(dedupe_key) between 3 and 128),
++  kind       text not null check (kind in ('announcement','syllabus','slot_reminder')),
++  title      text not null,
++  body       text not null,
++  status     text not null default 'queued' check (status in ('queued','sending','sent','failed')),
++  created_at timestamptz not null default now(),
++  sent_at    timestamptz,
++  unique (user_id, dedupe_key)            -- ek user ko ek event ka sirf ek notification
++);
++create index if not exists notification_log_status_idx on public.notification_log(status, created_at);
++alter table public.notification_log enable row level security;
++drop policy if exists "notification_log_select_own" on public.notification_log;
++create policy "notification_log_select_own" on public.notification_log
++  for select to authenticated using ((select auth.uid()) = user_id);
++revoke all on public.notification_log from anon, authenticated;
++grant select on public.notification_log to authenticated;
++
++create or replace function public.enqueue_announcement_notifications(p_announcement_id uuid)
++returns integer language plpgsql security definer set search_path = '' as $$
++declare v_count integer; v_title text; v_body text; v_status text;
++begin
++  if not public.is_admin() then raise exception 'forbidden' using errcode = '42501'; end if;
++  select title, body, status into v_title, v_body, v_status
++    from public.announcements where id = p_announcement_id;
++  if not found then raise exception 'announcement not found' using errcode = 'P0002'; end if;
++  if v_status <> 'published' then raise exception 'announcement not published' using errcode = '22023'; end if;
++
++  insert into public.notification_log (user_id, dedupe_key, kind, title, body)
++  select distinct dt.user_id, 'announcement:' || p_announcement_id::text, 'announcement', v_title, left(v_body, 500)
++  from public.device_tokens dt
++  on conflict (user_id, dedupe_key) do nothing;     -- dobara publish = 0 naye rows
++  get diagnostics v_count = row_count;
++  return v_count;
++end; $$;
++revoke execute on function public.enqueue_announcement_notifications(uuid) from public, anon;
++grant  execute on function public.enqueue_announcement_notifications(uuid) to authenticated;
++
++-- ============ 6) Admin audit log ============
++create table if not exists public.admin_audit_log (
++  id         uuid primary key default gen_random_uuid(),
++  actor_id   uuid not null references auth.users(id) on delete cascade,
++  action     text not null,
++  entity     text not null,
++  entity_id  text,
++  meta       jsonb not null default '{}'::jsonb,
++  created_at timestamptz not null default now()
++);
++alter table public.admin_audit_log enable row level security;
++drop policy if exists "audit_admin_select" on public.admin_audit_log;
++drop policy if exists "audit_admin_insert" on public.admin_audit_log;
++create policy "audit_admin_select" on public.admin_audit_log
++  for select to authenticated using ((select public.is_admin()));
++create policy "audit_admin_insert" on public.admin_audit_log
++  for insert to authenticated with check ((select public.is_admin()) and actor_id = (select auth.uid()));
++revoke all on public.admin_audit_log from anon, authenticated;
++grant select, insert on public.admin_audit_log to authenticated;   -- update/delete nahi: log tamper-proof
++
++-- ============ Pehla admin banane ke liye (SQL Editor mein, apna user id daalo) ============
++-- insert into public.user_roles (user_id, role) values ('<YOUR-AUTH-USER-UUID>', 'admin')
++--   on conflict (user_id) do update set role = 'admin';
+diff --git a/tests/dedupe.test.ts b/tests/dedupe.test.ts
+new file mode 100644
+index 0000000..fe412fd
+--- /dev/null
++++ b/tests/dedupe.test.ts
+@@ -0,0 +1,37 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { RecentKeyGuard, buildDedupeKey, uniqueByUserAndKey } from '../lib/notifications/dedupe';
++
++test('buildDedupeKey is stable and validates input', () => {
++  assert.equal(buildDedupeKey('announcement', 'abc-123'), 'announcement:abc-123');
++  assert.equal(buildDedupeKey('slot_reminder', 'slot1', '2026-10-24'), 'slot_reminder:slot1:2026-10-24');
++  assert.equal(buildDedupeKey('announcement', 'abc-123'), buildDedupeKey('announcement', 'abc-123'));
++  assert.throws(() => buildDedupeKey('announcement', 'bad id'));
++  assert.throws(() => buildDedupeKey('announcement', "x'; drop table"));
++  assert.throws(() => buildDedupeKey('announcement', 'ok', 'bad scope'));
++});
++
++test('uniqueByUserAndKey keeps first, same user different key survives', () => {
++  const rows = [
++    { user_id: 'u1', dedupe_key: 'k1', n: 1 },
++    { user_id: 'u1', dedupe_key: 'k1', n: 2 },
++    { user_id: 'u1', dedupe_key: 'k2', n: 3 },
++    { user_id: 'u2', dedupe_key: 'k1', n: 4 },
++  ];
++  assert.deepEqual(uniqueByUserAndKey(rows).map((r) => r.n), [1, 3, 4]);
++});
++
++test('RecentKeyGuard blocks inside the window and allows after it', () => {
++  const g = new RecentKeyGuard(30_000);
++  assert.equal(g.isDuplicate('a', 1_000), false);
++  assert.equal(g.isDuplicate('a', 20_000), true);
++  assert.equal(g.isDuplicate('b', 20_000), false);
++  assert.equal(g.isDuplicate('a', 31_001), false);
++});
++
++test('RecentKeyGuard memory stays bounded', () => {
++  const g = new RecentKeyGuard(1_000_000, 50);
++  for (let i = 0; i < 500; i++) g.isDuplicate(`k${i}`, i);
++  assert.equal(g.isDuplicate('k499', 600), true);    // recent key still remembered
++  assert.equal(g.isDuplicate('k0', 600), false);     // oldest evicted
++});
+diff --git a/tests/validators.test.ts b/tests/validators.test.ts
+new file mode 100644
+index 0000000..de63a51
+--- /dev/null
++++ b/tests/validators.test.ts
+@@ -0,0 +1,63 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import {
++  parseAnnouncementInput, parseAnnouncementPatch, parseDeviceInput, parseSyllabusInput, parseSyllabusPatch, isUuid,
++} from '../lib/admin/validators';
++
++const UUID = '123e4567-e89b-12d3-a456-426614174000';
++
++test('announcement: valid input is trimmed and defaulted', () => {
++  const r = parseAnnouncementInput({ title: '  Mock test Sunday  ', body: 'Be ready' });
++  assert.ok(r.ok);
++  if (r.ok) { assert.equal(r.value.title, 'Mock test Sunday'); assert.equal(r.value.audience, 'all'); }
++});
++
++test('announcement: rejects short title, long body, bad audience, non-object', () => {
++  assert.equal(parseAnnouncementInput({ title: 'ab', body: 'x' }).ok, false);
++  assert.equal(parseAnnouncementInput({ title: 'Valid', body: 'x'.repeat(2001) }).ok, false);
++  assert.equal(parseAnnouncementInput({ title: 'Valid', body: 'x', audience: 'admins' }).ok, false);
++  assert.equal(parseAnnouncementInput(null).ok, false);
++  assert.equal(parseAnnouncementInput('str').ok, false);
++  assert.equal(parseAnnouncementInput([]).ok, false);
++});
++
++test('announcement: control characters are stripped, title newlines flattened', () => {
++  const r = parseAnnouncementInput({ title: 'Hello\u0000\nWorld', body: 'a\u0007b' });
++  assert.ok(r.ok);
++  if (r.ok) { assert.equal(r.value.title, 'Hello World'); assert.equal(r.value.body, 'ab'); }
++});
++
++test('announcement patch: needs uuid, publish+archive conflict rejected', () => {
++  assert.equal(parseAnnouncementPatch({ id: 'nope', publish: true }).ok, false);
++  assert.equal(parseAnnouncementPatch({ id: UUID, publish: true, archive: true }).ok, false);
++  const r = parseAnnouncementPatch({ id: UUID, publish: true, role: 'admin', status: 'published' });
++  assert.ok(r.ok);
++  if (r.ok) assert.deepEqual(Object.keys(r.value).sort(), ['id', 'publish']);   // unknown/mass-assignment fields drop
++});
++
++test('syllabus: valid, bad sortOrder, non-boolean isActive', () => {
++  assert.ok(parseSyllabusInput({ subject: 'Physics', chapter: 'Rotation', topic: 'Torque' }).ok);
++  assert.equal(parseSyllabusInput({ subject: 'Physics', chapter: 'Rotation', topic: 'T', sortOrder: -1 }).ok, false);
++  assert.equal(parseSyllabusInput({ subject: 'Physics', chapter: 'Rotation', topic: 'T', sortOrder: 1.5 }).ok, false);
++  assert.equal(parseSyllabusInput({ subject: 'Physics', chapter: 'Rotation', topic: 'T', isActive: 'yes' }).ok, false);
++});
++
++test('syllabus patch: empty patch rejected', () => {
++  assert.equal(parseSyllabusPatch({ id: UUID }).ok, false);
++  assert.ok(parseSyllabusPatch({ id: UUID, isActive: false }).ok);
++});
++
++test('device: token/platform validation', () => {
++  const token = 'a'.repeat(40);
++  assert.ok(parseDeviceInput({ token, platform: 'android', appVersion: '1.0' }).ok);
++  assert.equal(parseDeviceInput({ token: 'short', platform: 'android' }).ok, false);
++  assert.equal(parseDeviceInput({ token: 'a b'.repeat(20), platform: 'android' }).ok, false);
++  assert.equal(parseDeviceInput({ token, platform: 'symbian' }).ok, false);
++  assert.equal(parseDeviceInput({ token, platform: 'web', appVersion: 'v'.repeat(33) }).ok, false);
++});
++
++test('isUuid', () => {
++  assert.ok(isUuid(UUID));
++  assert.equal(isUuid('123'), false);
++  assert.equal(isUuid(undefined), false);
++});
+-- 
+2.43.0
+
+
+From 87c5c411028ca2bf77072f51740bd35cc7272cdd Mon Sep 17 00:00:00 2001
+From: UpgradeHub <dev@upgradehub.local>
+Date: Sat, 24 Oct 2026 09:04:12 +0000
+Subject: [PATCH 2/2] chore(day-9): daily cron retry for queued push
+ notifications
+
+---
+ vercel.json | 5 +++++
+ 1 file changed, 5 insertions(+)
+ create mode 100644 vercel.json
+
+diff --git a/vercel.json b/vercel.json
+new file mode 100644
+index 0000000..95221d6
+--- /dev/null
++++ b/vercel.json
+@@ -0,0 +1,5 @@
++{
++  "crons": [
++    { "path": "/api/internal/notifications/dispatch", "schedule": "0 3 * * *" }
++  ]
++}
+-- 
+2.43.0
+
